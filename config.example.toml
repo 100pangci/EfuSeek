@@ -1,7 +1,6 @@
 # Copy into ~/.config/efuseek/config.toml and adjust for your machine.
 efu_path = "/mnt/nas/index/files.efu"
 cache_dir = "" # Empty uses the XDG cache directory.
-result_limit = 500
 poll_seconds = 5
 debounce_ms = 75
 window_width = 1100

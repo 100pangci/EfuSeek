@@ -26,6 +26,7 @@ pub enum Event {
     },
     Results {
         generation: u64,
+        count: u64,
         entries: Vec<Entry>,
     },
     SearchError {
@@ -43,6 +44,7 @@ pub struct PageRequest {
     pub offset: u32,
     pub limit: u32,
     pub sort: Sort,
+    pub searching: bool,
 }
 pub struct SearchRequest {
     pub generation: u64,
@@ -207,77 +209,71 @@ impl Workers {
         {
             let stop = stop.clone();
             let latest = latest.clone();
-            let db = db.clone();
-            let revision = revision.clone();
-            let send = send.clone();
-            let repair = repair.clone();
             thread::spawn(move || {
                 let mut cached: Option<Index> = None;
                 let mut seen_revision = u64::MAX;
+                let mut prepared_generation = None;
                 while !stop.load(Ordering::Relaxed) {
-                    let Ok(mut request) = requests.recv_timeout(Duration::from_millis(100)) else {
-                        continue;
-                    };
-                    while let Ok(newer) = requests.try_recv() {
-                        request = newer;
-                    }
-                    if latest.load(Ordering::Relaxed) != request.generation {
-                        continue;
-                    }
-                    let now = revision.load(Ordering::Acquire);
-                    let result = (|| -> anyhow::Result<Vec<Entry>> {
-                        if cached.is_none() || now != seen_revision {
-                            cached = Some(Index::open(&db)?);
-                            seen_revision = now;
+                    // Search preparation and page reads share one connection so that an
+                    // atomic cache replacement cannot mix a result count with another inode.
+                    if let Ok(mut request) = requests.try_recv() {
+                        while let Ok(newer) = requests.try_recv() {
+                            request = newer;
                         }
-                        match cached.as_ref() {
-                            Some(index) => {
-                                index.set_cancellation(
-                                    latest.clone(),
-                                    request.generation,
-                                    stop.clone(),
-                                );
-                                index.search_sorted(
-                                    &Query::parse(&request.text),
-                                    config.result_limit,
-                                    request.sort,
-                                )
+                        if latest.load(Ordering::Relaxed) != request.generation {
+                            continue;
+                        }
+                        prepared_generation = None;
+                        let now = revision.load(Ordering::Acquire);
+                        let result = (|| -> anyhow::Result<(u64, Vec<Entry>)> {
+                            if cached.is_none() || now != seen_revision {
+                                cached = Some(Index::open(&db)?);
+                                seen_revision = now;
                             }
-                            None => anyhow::bail!("暂无可用索引"),
+                            match cached.as_ref() {
+                                Some(index) => {
+                                    index.set_cancellation(
+                                        latest.clone(),
+                                        request.generation,
+                                        stop.clone(),
+                                    );
+                                    let count = index.prepare_search(
+                                        &Query::parse(&request.text),
+                                        request.sort,
+                                    )?;
+                                    Ok((count, index.search_page(0, config.browse_page_size)?))
+                                }
+                                None => anyhow::bail!("暂无可用索引"),
+                            }
+                        })();
+                        if latest.load(Ordering::Relaxed) != request.generation
+                            || stop.load(Ordering::Relaxed)
+                        {
+                            continue;
                         }
-                    })();
-                    if latest.load(Ordering::Relaxed) != request.generation
-                        || stop.load(Ordering::Relaxed)
-                    {
+                        let event = match result {
+                            Ok((count, entries)) => {
+                                prepared_generation = Some(request.generation);
+                                Event::Results {
+                                    generation: request.generation,
+                                    count,
+                                    entries,
+                                }
+                            }
+                            Err(error) => {
+                                cached = None;
+                                repair.store(true, Ordering::Relaxed);
+                                Event::SearchError {
+                                    generation: request.generation,
+                                    message: format!("搜索暂不可用：{error:#}"),
+                                }
+                            }
+                        };
+                        if send.send(event).is_err() {
+                            break;
+                        }
                         continue;
                     }
-                    let event = match result {
-                        Ok(entries) => Event::Results {
-                            generation: request.generation,
-                            entries,
-                        },
-                        Err(error) => {
-                            cached = None;
-                            repair.store(true, Ordering::Relaxed);
-                            Event::SearchError {
-                                generation: request.generation,
-                                message: format!("搜索暂不可用：{error:#}"),
-                            }
-                        }
-                    };
-                    if send.send(event).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        {
-            let stop = stop.clone();
-            let latest = latest.clone();
-            thread::spawn(move || {
-                let mut cached: Option<Index> = None;
-                let mut seen_revision = u64::MAX;
-                while !stop.load(Ordering::Relaxed) {
                     let Ok(request) = page_requests.recv_timeout(Duration::from_millis(100)) else {
                         continue;
                     };
@@ -286,9 +282,16 @@ impl Workers {
                     }
                     let now = revision.load(Ordering::Acquire);
                     let result = (|| -> anyhow::Result<Vec<Entry>> {
-                        if cached.is_none() || now != seen_revision {
+                        if request.searching && prepared_generation != Some(request.generation) {
+                            anyhow::bail!("搜索结果已失效，请重新搜索");
+                        }
+                        if cached.is_none()
+                            || (now != seen_revision
+                                && prepared_generation != Some(request.generation))
+                        {
                             cached = Some(Index::open(&db)?);
                             seen_revision = now;
+                            prepared_generation = None;
                         }
                         match cached.as_ref() {
                             Some(index) => {
@@ -297,12 +300,18 @@ impl Workers {
                                     request.generation,
                                     stop.clone(),
                                 );
-                                index.browse_sorted(request.offset, request.limit, request.sort)
+                                if request.searching {
+                                    index.search_page(request.offset, request.limit)
+                                } else {
+                                    index.browse_sorted(request.offset, request.limit, request.sort)
+                                }
                             }
                             None => anyhow::bail!("暂无可用索引"),
                         }
                     })();
-                    if latest.load(Ordering::Relaxed) != request.generation {
+                    if latest.load(Ordering::Relaxed) != request.generation
+                        || stop.load(Ordering::Relaxed)
+                    {
                         continue;
                     }
                     let event = match result {

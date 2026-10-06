@@ -61,6 +61,7 @@ fn automatic_update_preserves_cache_on_failure() -> Result<()> {
         offset: 0,
         limit: 512,
         sort: Default::default(),
+        searching: false,
     })?;
     let page = wait(&workers, |e| matches!(e, Event::Page { generation: 4, .. }))?;
     assert!(matches!(page, Event::Page { entries, .. } if entries.len() == 1 && entries[0].is_dir));
@@ -205,6 +206,7 @@ fn growing_source_waits_without_replacing_old_index() -> Result<()> {
         offset: 0,
         limit: 1,
         sort,
+        searching: false,
     })?;
     assert!(
         matches!(wait(&workers, |e| matches!(e, Event::Page { generation: 5, .. }))?, Event::Page { entries, .. } if entries[0].name == "new2.txt")
@@ -217,6 +219,66 @@ fn growing_source_waits_without_replacing_old_index() -> Result<()> {
     })?;
     assert!(
         matches!(wait(&workers, |e| matches!(e, Event::Results { generation: 6, .. }))?, Event::Results { entries, .. } if entries.len() == 3 && entries[0].name == "new2.txt")
+    );
+    Ok(())
+}
+
+#[test]
+fn full_search_has_all_matches_and_deep_pages() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("test.efu");
+    let db = directory.path().join("cache.sqlite");
+    let mut data = String::from("Filename\n");
+    for n in 0..6100 {
+        data.push_str(&format!("/data/video{n:05}.mkv\n"));
+    }
+    fs::write(&source, data)?;
+    rebuild(&source, &db)?;
+    fs::remove_file(&source)?;
+    let workers = Workers::start(
+        Config {
+            efu_path: source,
+            browse_page_size: 128,
+            ..Config::default()
+        },
+        db,
+    );
+    wait(&workers, |e| {
+        matches!(e, Event::Status { changed: true, .. })
+    })?;
+    assert!(
+        matches!(search(&workers, 1, "ext:mkv")?, Event::Results { count: 6100, entries, .. } if entries.len() == 128)
+    );
+    workers.pages.send(PageRequest {
+        generation: 1,
+        offset: 6000,
+        limit: 128,
+        sort: Default::default(),
+        searching: true,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page { generation: 1, .. }))?, Event::Page { entries, .. } if entries.len() == 100 && entries[99].name == "video06099.mkv")
+    );
+    // Older page requests cannot contaminate a newer query or sort.
+    assert!(
+        matches!(search(&workers, 2, "video00001")?, Event::Results { count: 1, entries, .. } if entries.len() == 1)
+    );
+    workers.pages.send(PageRequest {
+        generation: 1,
+        offset: 512,
+        limit: 128,
+        sort: Default::default(),
+        searching: true,
+    })?;
+    workers.pages.send(PageRequest {
+        generation: 2,
+        offset: 0,
+        limit: 128,
+        sort: Default::default(),
+        searching: true,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page { generation: 2, .. }))?, Event::Page { entries, .. } if entries.len() == 1 && entries[0].name == "video00001.mkv")
     );
     Ok(())
 }

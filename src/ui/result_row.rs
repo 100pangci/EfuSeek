@@ -141,7 +141,16 @@ pub fn show_context_menu(
         1,
         1,
     )));
-    popover.connect_closed(|popover| popover.unparent());
+    popover.connect_closed(|popover| {
+        // GTK closes a menu before dispatching the clicked item's action. Keep
+        // its action group alive until that dispatch completes.
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || {
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+    });
     popover.popup();
 }
 
@@ -163,6 +172,20 @@ mod tests {
             child = widget.next_sibling();
         }
         None
+    }
+
+    fn click_menu_item(popover: &gtk::PopoverMenu, text: &str) {
+        let label = find_label(popover.upcast_ref(), text).expect("menu item label");
+        let mut widget = label.upcast::<gtk::Widget>();
+        loop {
+            if glib::subclass::SignalId::lookup("clicked", widget.type_()).is_some() {
+                // Exercise native close-before-action dispatch, not activate_action
+                // directly: premature unparenting silently loses the clicked action.
+                widget.emit_by_name::<()>("clicked", &[]);
+                return;
+            }
+            widget = widget.parent().expect("native clickable menu item");
+        }
     }
 
     // Explicit opt-in: normal Core tests never require a display or clipboard.
@@ -256,7 +279,11 @@ mod tests {
                 .as_deref(),
             Some("Z:\\日本\\unmapped.mkv")
         );
-        popover.activate_action("row.name", None).unwrap();
+        click_menu_item(&popover, "复制文件名");
+        assert!(
+            popover.parent().is_some(),
+            "menu actions must survive native close dispatch"
+        );
         assert_eq!(
             context
                 .block_on(clipboard.read_text_future())

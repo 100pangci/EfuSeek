@@ -18,7 +18,7 @@ adw = { package = "libadwaita", version = "0.8", features = ["v1_4"], optional =
 log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
-gio = "0.21"
+gio = { version = "0.21", features = ["v2_60"] }
 
 [features]
 default = ["gui"]

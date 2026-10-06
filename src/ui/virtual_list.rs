@@ -13,6 +13,7 @@ mod imp {
         pub count: Cell<u32>,
         pub generation: Cell<u64>,
         pub sort: Cell<Sort>,
+        pub searching: Cell<bool>,
         pub page_size: Cell<u32>,
         pub max_pages: Cell<usize>,
         pub sender: RefCell<Option<Sender<PageRequest>>>,
@@ -60,6 +61,7 @@ mod imp {
                     offset,
                     limit: page_size,
                     sort: self.sort.get(),
+                    searching: self.searching.get(),
                 });
             }
             let mut placeholders = self.placeholders.borrow_mut();
@@ -108,12 +110,26 @@ impl VirtualList {
         self.imp().max_pages.set(max_pages.clamp(1, 64));
     }
     pub fn browse(&self, total: u64, generation: u64, sender: Sender<PageRequest>, sort: Sort) {
+        self.reset_pages(total, generation, sender, sort, false);
+    }
+    pub fn search(&self, total: u64, generation: u64, sender: Sender<PageRequest>, sort: Sort) {
+        self.reset_pages(total, generation, sender, sort, true);
+    }
+    fn reset_pages(
+        &self,
+        total: u64,
+        generation: u64,
+        sender: Sender<PageRequest>,
+        sort: Sort,
+        searching: bool,
+    ) {
         let imp = self.imp();
         let old = imp.count.get();
         let count = total.min(u64::from(u32::MAX)) as u32;
         imp.count.set(count);
         imp.generation.set(generation);
         imp.sort.set(sort);
+        imp.searching.set(searching);
         *imp.sender.borrow_mut() = Some(sender);
         imp.results.borrow_mut().take();
         imp.pages.borrow_mut().clear();
@@ -195,6 +211,11 @@ mod tests {
         assert_eq!(receive.try_recv().unwrap().sort, sort);
         model.page(3, 0, vec![Entry::new("/old-sort".into(), None, None, None)]);
         assert!(model.imp().pages.borrow().is_empty());
+        let (send, receive) = std::sync::mpsc::channel();
+        model.search(6100, 5, send, sort);
+        assert_eq!(model.n_items(), 6100);
+        assert!(model.item(6099).is_some());
+        assert!(receive.try_recv().unwrap().searching);
         model.results(vec![Entry::new("/result".into(), None, None, None)]);
         assert_eq!(model.n_items(), 1);
     }

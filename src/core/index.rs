@@ -128,6 +128,8 @@ impl Index {
                 r.get(0)
             })?;
         let info = toml::from_str(&text)?;
+        // Full search results live in a disk-backed temporary SQLite table, never in GTK.
+        connection.pragma_update(None, "temp_store", "FILE")?;
         // Also verify the search tables are present; corrupt pages are reported by search.
         connection.prepare("SELECT e.id FROM entries e JOIN search s ON s.rowid=e.id LIMIT 0")?;
         if version == 1 {
@@ -160,6 +162,37 @@ impl Index {
     }
 
     pub fn search_sorted(&self, query: &Query, limit: usize, sort: Sort) -> Result<Vec<Entry>> {
+        let (from, order, mut values) = self.search_sql(query, sort);
+        values.push((limit.min(5000) as i64).into());
+        let sql = format!(
+            "SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir {from} ORDER BY {order} LIMIT ?{}",
+            values.len()
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), read_entry)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Materialize only ordered row IDs. The same connection/inode serves count and pages.
+    pub fn prepare_search(&self, query: &Query, sort: Sort) -> Result<u64> {
+        self.connection.execute_batch("DROP TABLE IF EXISTS temp.matches; CREATE TEMP TABLE matches(position INTEGER PRIMARY KEY,entry_id INTEGER NOT NULL);")?;
+        let (from, order, values) = self.search_sql(query, sort);
+        self.connection.execute(
+            &format!("INSERT INTO temp.matches(entry_id) SELECT e.id {from} ORDER BY {order}"),
+            rusqlite::params_from_iter(values),
+        )?;
+        Ok(self.connection.changes())
+    }
+
+    pub fn search_page(&self, offset: u32, limit: u32) -> Result<Vec<Entry>> {
+        let mut statement = self.connection.prepare("SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM temp.matches m JOIN entries e ON e.id=m.entry_id WHERE m.position>?1 ORDER BY m.position LIMIT ?2")?;
+        let rows = statement.query_map(params![offset, limit.min(1024)], read_entry)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn search_sql(&self, query: &Query, sort: Sort) -> (String, String, Vec<Value>) {
         let mut values: Vec<Value> = Vec::new();
         let mut filters = vec!["1".to_owned()];
         let mut phrases = Vec::new();
@@ -211,16 +244,11 @@ impl Index {
             }
             self.order_by(sort, true, values.len())
         };
-        values.push((limit.min(5000) as i64).into());
-        let sql = format!(
-            "SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM entries e {join} WHERE {} ORDER BY {order} LIMIT ?{}",
-            filters.join(" AND "),
-            values.len()
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(values), read_entry)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        (
+            format!("FROM entries e {join} WHERE {}", filters.join(" AND ")),
+            order,
+            values,
+        )
     }
 }
 
@@ -511,6 +539,11 @@ mod tests {
         let latest = Arc::new(AtomicU64::new(2));
         let stop = Arc::new(AtomicBool::new(false));
         index.set_cancellation(latest.clone(), 1, stop.clone());
+        assert!(
+            index
+                .prepare_search(&Query::parse("file"), Sort::default())
+                .is_err()
+        );
         assert!(index.search(&Query::parse("a"), 500).is_err());
         assert!(
             index
@@ -525,7 +558,62 @@ mod tests {
                 .is_err()
         );
         index.set_cancellation(latest, 2, stop);
+        assert_eq!(
+            index.prepare_search(&Query::parse("file"), Sort::default())?,
+            10_000
+        );
+        assert_eq!(index.search_page(9999, 10)?.len(), 1);
         assert_eq!(index.search(&Query::parse("file9999"), 500)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn full_search_pages_are_unlimited_sorted_and_snapshot_safe() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("test.efu");
+        let db = dir.path().join("index.sqlite");
+        let mut data = String::from("Filename,Size,Date Modified\n");
+        for n in 0..6100 {
+            data.push_str(&format!(
+                "/data/video{n:05}.mkv,{n},{}\n",
+                116444736000000000_i64 + n
+            ));
+        }
+        fs::write(&source, data)?;
+        rebuild(&source, &db)?;
+        let index = Index::open(&db)?;
+        assert_eq!(
+            index.prepare_search(&Query::parse("file:video ext:mkv"), Sort::default())?,
+            6100
+        );
+        let rows = index.search_page(6000, 200)?;
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].name, "video06000.mkv");
+        assert_eq!(rows[99].name, "video06099.mkv");
+        assert!(index.search_page(6100, 200)?.is_empty());
+        assert_eq!(index.search_page(0, 10000)?.len(), 1024);
+        for field in [SortField::Name, SortField::Size, SortField::Modified] {
+            assert_eq!(
+                index.prepare_search(
+                    &Query::parse("ext:mkv"),
+                    Sort {
+                        field,
+                        direction: SortDirection::Descending
+                    }
+                )?,
+                6100
+            );
+            assert_eq!(index.search_page(0, 2)?[0].name, "video06099.mkv");
+            assert_eq!(index.search_page(6099, 2)?[0].name, "video00000.mkv");
+        }
+        fs::write(&source, "Filename\n/new.txt\n")?;
+        rebuild(&source, &db)?;
+        assert_eq!(index.search_page(0, 2)?[0].name, "video06099.mkv");
+        assert_eq!(
+            index.prepare_search(&Query::parse("absent"), Sort::default())?,
+            0
+        );
+        assert!(index.search_page(0, 512)?.is_empty());
         Ok(())
     }
 }

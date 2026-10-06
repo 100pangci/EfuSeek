@@ -450,7 +450,6 @@ pub fn build(app: &adw::Application) {
         });
     }
     let weak_window = window.downgrade();
-    let limit = config.borrow().result_limit;
     let index_status = Rc::new(RefCell::new(String::from("正在加载本地缓存…")));
     {
         let (status, search, index_status) = (status.clone(), search.clone(), index_status.clone());
@@ -462,7 +461,7 @@ pub fn build(app: &adw::Application) {
                 if search.text().trim().is_empty() {
                     "（全部索引，按需加载）".to_owned()
                 } else {
-                    format!("（搜索上限 {limit}）")
+                    "（全部匹配，按需加载）".to_owned()
                 }
             ));
         });
@@ -517,25 +516,26 @@ pub fn build(app: &adw::Application) {
                         if search.text().trim().is_empty() {
                             "（全部索引，按需加载）".to_owned()
                         } else {
-                            format!("（搜索上限 {limit}）")
+                            "（全部匹配，按需加载）".to_owned()
                         }
                     ));
                 }
                 Event::Results {
                     generation: received,
+                    count,
                     entries,
                 } if received == generation.get() => {
                     selection.set_model(None::<&gtk::gio::ListModel>);
-                    model.results(entries);
+                    model.search(count, received, workers.borrow().pages.clone(), sort.get());
+                    model.page(received, 0, entries);
                     selection.set_model(Some(&model));
                     if model.n_items() > 0 {
                         selection.set_selected(0);
                     }
                     status.set_text(&format!(
-                        "{}    显示 {} 条（上限 {}）",
+                        "{}    显示 {} 条（全部匹配，按需加载）",
                         index_status.borrow(),
                         model.n_items(),
-                        limit
                     ));
                 }
                 Event::SearchError {

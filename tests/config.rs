@@ -8,7 +8,6 @@ fn example_and_defaults_roundtrip() -> anyhow::Result<()> {
     let default: Config = toml::from_str("")?;
     let roundtrip: Config = toml::from_str(&toml::to_string(&default)?)?;
     assert_eq!(roundtrip.efu_path, default.efu_path);
-    assert_eq!(roundtrip.result_limit, 500);
     assert!(roundtrip.path_map.is_empty());
     assert!(roundtrip.efu_path.as_os_str().is_empty());
     assert!(roundtrip.cache_dir.as_os_str().is_empty());
@@ -53,10 +52,10 @@ fn save_settings_preserves_other_fields_and_backs_up() -> anyhow::Result<()> {
         to: "/nas/中文/".into(),
     };
     let config = Config::save_settings_to(&path, "/new.efu".into(), vec![map.clone()])?;
-    assert_eq!(config.result_limit, 123);
     assert_eq!(config.poll_seconds, 9);
     assert_eq!(config.path_map, vec![map]);
     let document: toml::Table = toml::from_str(&fs::read_to_string(&path)?)?;
+    assert_eq!(document["result_limit"].as_integer(), Some(123)); // Legacy field is preserved but ignored.
     assert_eq!(document["future_option"].as_str(), Some("keep"));
     assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
     let backups: Vec<_> = fs::read_dir(directory.path())?

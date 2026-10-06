@@ -7,7 +7,6 @@ use std::{env, fs, path::PathBuf};
 #[serde(default)]
 pub struct Config {
     pub efu_path: PathBuf,
-    pub result_limit: usize,
     pub poll_seconds: u64,
     pub path_map: Vec<PathMap>,
     pub cache_dir: PathBuf,
@@ -24,7 +23,6 @@ struct BuiltinDefaults {
     efu_path: PathBuf,
     path_map: Vec<PathMap>,
     cache_dir: PathBuf,
-    result_limit: usize,
     poll_seconds: u64,
     debounce_ms: u64,
     window_width: i32,
@@ -44,7 +42,6 @@ impl Default for Config {
             efu_path: defaults.efu_path.clone(),
             path_map: defaults.path_map.clone(),
             cache_dir: defaults.cache_dir.clone(),
-            result_limit: defaults.result_limit,
             poll_seconds: defaults.poll_seconds,
             debounce_ms: defaults.debounce_ms,
             window_width: defaults.window_width,
@@ -183,7 +180,6 @@ impl Config {
         config.validated()
     }
     pub fn validated(mut self) -> Result<Self> {
-        self.result_limit = self.result_limit.clamp(1, 5000);
         self.poll_seconds = self.poll_seconds.clamp(1, 86400);
         self.debounce_ms = self.debounce_ms.clamp(1, 2000);
         self.window_width = self.window_width.clamp(480, 7680);
