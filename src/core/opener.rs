@@ -22,6 +22,13 @@ pub fn open(
     };
     let description = if parent { "所在目录" } else { "目标" };
     let target_display = target.display().to_string();
+    let item_uri = match map_path(&entry.path, maps) {
+        Ok(path) => gio::File::for_path(path).uri(),
+        Err(error) => {
+            done(Err(error.to_string()));
+            return;
+        }
+    };
     let file = gio::File::for_path(target);
     let uri = file.uri();
     file.query_info_async(
@@ -46,25 +53,11 @@ pub fn open(
                 return;
             }
             if info.file_type() == gio::FileType::Directory {
-                // Choose the directory handler explicitly; a file/URI handler must
-                // never send the containing folder to a video player or other app.
-                let Some(app) = gio::AppInfo::default_for_type("inode/directory", false) else {
-                    done(Err(
-                        "未设置文件管理器，请为 inode/directory 配置默认应用。".into()
-                    ));
-                    return;
-                };
-                app.launch_uris_async(
-                    &[&uri],
-                    gio::AppLaunchContext::NONE,
-                    gio::Cancellable::NONE,
-                    move |result| {
-                        done(result.map_err(|error| {
-                            log::warn!("启动文件管理器失败: {error}");
-                            format!("无法启动文件管理器：{error}")
-                        }));
-                    },
-                );
+                if parent {
+                    reveal_item(item_uri.to_string(), uri.to_string(), done);
+                } else {
+                    launch_directory(&uri, done);
+                }
                 return;
             }
             gio::AppInfo::launch_default_for_uri_async(
@@ -77,6 +70,69 @@ pub fn open(
             );
         },
     );
+}
+
+fn launch_directory(uri: &str, done: impl FnOnce(Result<(), String>) + 'static) {
+    // Never send a directory through a file/URI handler (e.g. a video player).
+    let Some(app) = gio::AppInfo::default_for_type("inode/directory", false) else {
+        done(Err(
+            "未设置文件管理器，请为 inode/directory 配置默认应用。".into()
+        ));
+        return;
+    };
+    app.launch_uris_async(
+        &[uri],
+        gio::AppLaunchContext::NONE,
+        gio::Cancellable::NONE,
+        move |result| done(result.map_err(|error| format!("无法启动文件管理器：{error}"))),
+    );
+}
+
+fn reveal_item(
+    item_uri: String,
+    directory_uri: String,
+    done: impl FnOnce(Result<(), String>) + 'static,
+) {
+    use gio::glib::variant::ToVariant;
+    gio::bus_get(
+        gio::BusType::Session,
+        gio::Cancellable::NONE,
+        move |result| {
+            let connection = match result {
+                Ok(connection) => connection,
+                Err(error) => {
+                    reveal_fallback(&directory_uri, error, done);
+                    return;
+                }
+            };
+            connection.call(
+                Some("org.freedesktop.FileManager1"),
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1",
+                "ShowItems",
+                Some(&(vec![item_uri], "").to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                5000,
+                gio::Cancellable::NONE,
+                move |result| match result {
+                    Ok(_) => done(Ok(())),
+                    Err(error) => reveal_fallback(&directory_uri, error, done),
+                },
+            );
+        },
+    );
+}
+
+fn reveal_fallback(
+    directory_uri: &str,
+    error: gio::glib::Error,
+    done: impl FnOnce(Result<(), String>) + 'static,
+) {
+    log::warn!("文件管理器定位失败，降级打开目录: {error}");
+    launch_directory(directory_uri, move |result| {
+        done(result.and(Err(format!("已打开所在目录，但无法选中目标：{error}"))));
+    });
 }
 
 pub fn target_path(entry: &Entry, parent: bool, maps: &[PathMap]) -> anyhow::Result<PathBuf> {

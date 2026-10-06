@@ -31,11 +31,16 @@ fn mapped_video_parent_launches_directory_handler() -> anyhow::Result<()> {
             anyhow::ensure!(Instant::now() < deadline, "GIO callback timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
-        result
-            .borrow_mut()
-            .take()
-            .unwrap()
-            .map_err(anyhow::Error::msg)?;
+        // With no session bus, opening the folder remains a safe fallback, but
+        // the user is explicitly told that selecting the item was unavailable.
+        assert!(
+            result
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .unwrap_err()
+                .contains("无法选中目标")
+        );
         let marker = root.join("launched-uri");
         while !marker.exists() {
             anyhow::ensure!(
@@ -115,5 +120,114 @@ fn mapped_video_parent_launches_directory_handler() -> anyhow::Result<()> {
         .env("GIO_USE_PORTALS", "0")
         .status()?;
     anyhow::ensure!(status.success(), "isolated GIO opener test failed");
+    Ok(())
+}
+
+#[test]
+fn file_manager_show_items_selects_mapped_target() -> anyhow::Result<()> {
+    use gio::glib::variant::ToVariant;
+    if let Some(root) = std::env::var_os("EFUSEEK_REVEAL_TEST_ROOT") {
+        let root = PathBuf::from(root);
+        // A private session bus and fake FileManager1: never opens the user's
+        // Dolphin or changes global defaults, and needs no graphical display.
+        let bus = gio::TestDBus::new(gio::TestDBusFlags::NONE);
+        bus.up();
+        let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)?;
+        connection.call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            Some(&("org.freedesktop.FileManager1", 0_u32).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            5000,
+            gio::Cancellable::NONE,
+        )?;
+        let interface = gio::DBusNodeInfo::for_xml("<node><interface name='org.freedesktop.FileManager1'><method name='ShowItems'><arg type='as' direction='in'/><arg type='s' direction='in'/></method></interface></node>")?
+            .lookup_interface("org.freedesktop.FileManager1").unwrap();
+        let received = Rc::new(RefCell::new(Vec::<String>::new()));
+        let output = received.clone();
+        let registration = connection
+            .register_object("/org/freedesktop/FileManager1", &interface)
+            .method_call(move |_, _, _, _, method, parameters, invocation| {
+                assert_eq!(method, "ShowItems");
+                let (uris, startup_id) = parameters
+                    .get::<(Vec<String>, String)>()
+                    .expect("ShowItems signature");
+                assert_eq!(uris.len(), 1);
+                assert!(startup_id.is_empty());
+                output.borrow_mut().extend(uris);
+                invocation.return_value(Some(&().to_variant()));
+            })
+            .build()?;
+        let folder = root.join("日本 video # %");
+        fs::create_dir(&folder)?;
+        let file = folder.join("a '中#%\n.mkv");
+        fs::write(&file, "test")?;
+        let maps = [PathMap {
+            from: "Z:\\video.mkv".into(),
+            to: file.to_string_lossy().into_owned(),
+        }];
+        let context = gio::glib::MainContext::default();
+        for (entry, maps, expected) in [
+            (
+                Entry::new("Z:\\video.mkv".into(), None, None, None),
+                maps.as_slice(),
+                file,
+            ),
+            (
+                Entry::new(folder.to_string_lossy().into_owned(), None, None, Some(16)),
+                &[][..],
+                folder,
+            ),
+            (
+                Entry::new("/".into(), None, None, Some(16)),
+                &[][..],
+                PathBuf::from("/"),
+            ),
+        ] {
+            let result = Rc::new(RefCell::new(None));
+            let output = result.clone();
+            opener::open(&entry, true, maps, move |value| {
+                *output.borrow_mut() = Some(value)
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while result.borrow().is_none() {
+                context.iteration(false);
+                anyhow::ensure!(Instant::now() < deadline, "ShowItems callback timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result
+                .borrow_mut()
+                .take()
+                .unwrap()
+                .map_err(anyhow::Error::msg)?;
+            let uri = received.borrow_mut().pop().expect("one target URI");
+            assert_eq!(gio::File::for_uri(&uri).path(), Some(expected));
+            assert!(received.borrow().is_empty());
+        }
+        connection.unregister_object(registration)?;
+        connection.close_sync(gio::Cancellable::NONE)?;
+        drop(connection);
+        bus.down();
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "file_manager_show_items_selects_mapped_target",
+            "--nocapture",
+        ])
+        .env("EFUSEEK_REVEAL_TEST_ROOT", root)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("GIO_USE_PORTALS", "0")
+        .status()?;
+    anyhow::ensure!(status.success(), "isolated FileManager1 test failed");
     Ok(())
 }

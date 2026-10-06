@@ -282,3 +282,221 @@ fn full_search_has_all_matches_and_deep_pages() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn rapid_input_clear_and_sort_ignore_stale_requests() -> Result<()> {
+    use efuseek::core::sort::{Sort, SortDirection, SortField};
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("test.efu");
+    let db = directory.path().join("cache.sqlite");
+    fs::write(
+        &source,
+        "Filename\n/Anime/abc.mkv\n/Anime/ab.mkv\n/Other/a.txt\n",
+    )?;
+    rebuild(&source, &db)?;
+    fs::remove_file(&source)?;
+    let workers = Workers::start(
+        Config {
+            efu_path: source,
+            ..Config::default()
+        },
+        db,
+    );
+    wait(&workers, |e| {
+        matches!(e, Event::Status { changed: true, .. })
+    })?;
+    search(&workers, 1, "a")?;
+    // Make stale-queue rejection deterministic: publish final generation first,
+    // then enqueue intermediate input/sort/page requests (no timing sleeps).
+    workers.latest.store(20, Ordering::Relaxed);
+    for (n, text) in ["a", "ab", "abc", "ab", "a", "", "ext:mkv", "path:Anime"]
+        .iter()
+        .enumerate()
+    {
+        let generation = n as u64 + 2;
+        let sort = Sort {
+            field: [SortField::Name, SortField::Size, SortField::Modified][n % 3],
+            direction: SortDirection::Descending,
+        };
+        workers.search.send(SearchRequest {
+            generation,
+            text: (*text).into(),
+            sort,
+        })?;
+        workers.pages.send(PageRequest {
+            generation,
+            offset: 0,
+            limit: 2,
+            sort,
+            searching: !text.is_empty(),
+        })?;
+    }
+    let sort = Sort {
+        field: SortField::Name,
+        direction: SortDirection::Descending,
+    };
+    workers.search.send(SearchRequest {
+        generation: 20,
+        text: "path:Anime".into(),
+        sort,
+    })?;
+    loop {
+        match workers.events.recv_timeout(Duration::from_secs(10))? {
+            Event::Results {
+                generation,
+                count,
+                entries,
+            } => {
+                assert_eq!(generation, 20);
+                assert_eq!(count, 2);
+                assert_eq!(entries[0].name, "abc.mkv");
+                break;
+            }
+            Event::SearchError { message, .. } => bail!("unexpected error: {message}"),
+            Event::Page { .. } => bail!("stale page published"),
+            Event::Status { .. } => (),
+        }
+    }
+    workers.pages.send(PageRequest {
+        generation: 20,
+        offset: 1,
+        limit: 1,
+        sort,
+        searching: true,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 20, ..}))?, Event::Page {entries, ..} if entries[0].name == "ab.mkv")
+    );
+    // Clear actually returns to browse, then another filter prepares a new table.
+    workers.latest.store(21, Ordering::Relaxed);
+    workers.pages.send(PageRequest {
+        generation: 21,
+        offset: 0,
+        limit: 3,
+        sort,
+        searching: false,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 21, ..}))?, Event::Page {entries, ..} if entries.len() == 3)
+    );
+    assert!(matches!(
+        search(&workers, 22, "ext:mkv")?,
+        Event::Results { count: 2, .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn worker_error_then_repaired_cache_needs_no_restart() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("offline.efu");
+    let db = directory.path().join("cache.sqlite");
+    fs::write(&db, "corrupted cache")?;
+    let workers = Workers::start(
+        Config {
+            efu_path: source.clone(),
+            ..Config::default()
+        },
+        db.clone(),
+    );
+    workers.latest.store(1, Ordering::Relaxed);
+    workers.search.send(SearchRequest {
+        generation: 1,
+        text: "a".into(),
+        sort: Default::default(),
+    })?;
+    wait(&workers, |e| {
+        matches!(e, Event::SearchError { generation: 1, .. })
+    })?;
+    // Source becomes reachable and cache is repaired atomically. The same worker
+    // must reopen successfully even without a revision notification.
+    fs::write(&source, "Filename\n/Anime/abc.mkv\n")?;
+    rebuild(&source, &db)?;
+    fs::remove_file(&source)?;
+    assert!(
+        matches!(search(&workers, 2, "ext:mkv")?, Event::Results {count: 1, entries, ..} if entries[0].name == "abc.mkv")
+    );
+    Ok(())
+}
+
+#[test]
+fn index_revision_keeps_prepared_pages_on_old_inode() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("test.efu");
+    let db = directory.path().join("cache.sqlite");
+    fs::write(&source, "Filename\n/old/a.mkv\n/old/b.mkv\n")?;
+    rebuild(&source, &db)?;
+    let workers = Workers::start(
+        Config {
+            efu_path: source.clone(),
+            poll_seconds: 1,
+            ..Config::default()
+        },
+        db,
+    );
+    wait(&workers, |e| {
+        matches!(e, Event::Status { changed: true, .. })
+    })?;
+    assert!(matches!(
+        search(&workers, 1, "ext:mkv")?,
+        Event::Results { count: 2, .. }
+    ));
+    fs::write(&source, "Filename\n/new/c.mkv\n")?;
+    wait(
+        &workers,
+        |e| matches!(e, Event::Status {changed: true, info: Some(i), ..} if i.count == 1),
+    )?;
+    workers.pages.send(PageRequest {
+        generation: 1,
+        offset: 1,
+        limit: 1,
+        sort: Default::default(),
+        searching: true,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 1, ..}))?, Event::Page {entries, ..} if entries[0].path == "/old/b.mkv")
+    );
+    assert!(
+        matches!(search(&workers, 2, "ext:mkv")?, Event::Results {count: 1, entries, ..} if entries[0].path == "/new/c.mkv")
+    );
+    // Browse pages also belong to a snapshot, even though no matches table is
+    // needed. An updater notification must not swap their inode mid-generation.
+    workers.latest.store(3, Ordering::Relaxed);
+    workers.pages.send(PageRequest {
+        generation: 3,
+        offset: 0,
+        limit: 2,
+        sort: Default::default(),
+        searching: false,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 3, ..}))?, Event::Page {entries, ..} if entries[0].path == "/new/c.mkv")
+    );
+    fs::write(&source, "Filename\n/newer/d.mkv\n/newer/e.mkv\n")?;
+    wait(
+        &workers,
+        |e| matches!(e, Event::Status {changed: true, info: Some(i), ..} if i.count == 2),
+    )?;
+    workers.pages.send(PageRequest {
+        generation: 3,
+        offset: 0,
+        limit: 2,
+        sort: Default::default(),
+        searching: false,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 3, ..}))?, Event::Page {entries, ..} if entries.len() == 1 && entries[0].path == "/new/c.mkv")
+    );
+    workers.latest.store(4, Ordering::Relaxed);
+    workers.pages.send(PageRequest {
+        generation: 4,
+        offset: 0,
+        limit: 2,
+        sort: Default::default(),
+        searching: false,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page {generation: 4, ..}))?, Event::Page {entries, ..} if entries.len() == 2 && entries[0].path == "/newer/d.mkv")
+    );
+    Ok(())
+}

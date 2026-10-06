@@ -24,6 +24,17 @@ fn selected(selection: &gtk::SingleSelection) -> Option<Entry> {
         .filter(|entry| !entry.path.is_empty())
 }
 
+fn searching_feedback(search: &gtk::SearchEntry, label: &gtk::Label) {
+    if search.text().trim().is_empty() {
+        label.set_text("全部索引（按需加载）");
+    } else {
+        label.set_text(&format!(
+            "正在搜索“{}”…（列表仍为上一次结果）",
+            search.text()
+        ));
+    }
+}
+
 fn refresh(
     search: &gtk::SearchEntry,
     workers: &Workers,
@@ -169,6 +180,15 @@ pub fn build(app: &adw::Application) {
         .wrap(true)
         .build();
     content.append(&info_label);
+    // Search feedback is independent of periodic index status and page loads:
+    // neither may relabel old rows as matches for newly typed text.
+    let search_status = gtk::Label::builder()
+        .xalign(0.0)
+        .margin_start(12)
+        .margin_end(12)
+        .wrap(true)
+        .build();
+    content.append(&search_status);
     content.append(&status);
     overlay.set_child(Some(&content));
     window.set_content(Some(&overlay));
@@ -227,7 +247,7 @@ pub fn build(app: &adw::Application) {
     let total = Rc::new(Cell::new(0_u64));
     let sort = Rc::new(Cell::new(Sort::default()));
     {
-        let (workers, generation, model, selection, total, search, sort) = (
+        let (workers, generation, model, selection, total, search, sort, search_status) = (
             workers.clone(),
             generation.clone(),
             model.clone(),
@@ -235,6 +255,7 @@ pub fn build(app: &adw::Application) {
             total.clone(),
             search.clone(),
             sort.clone(),
+            search_status.clone(),
         );
         if let Some(sorter) = view.sorter().and_downcast::<gtk::ColumnViewSorter>() {
             sorter.connect_changed(move |sorter, _| {
@@ -253,6 +274,7 @@ pub fn build(app: &adw::Application) {
                     },
                 };
                 if sort.replace(next) != next {
+                    searching_feedback(&search, &search_status);
                     refresh(
                         &search,
                         &workers.borrow(),
@@ -268,7 +290,7 @@ pub fn build(app: &adw::Application) {
     }
     let debounce = Rc::new(RefCell::new(None::<glib::SourceId>));
     {
-        let (workers, generation, debounce, total, model, selection, config, sort) = (
+        let (workers, generation, debounce, total, model, selection, config, sort, search_status) = (
             workers.clone(),
             generation.clone(),
             debounce.clone(),
@@ -277,8 +299,10 @@ pub fn build(app: &adw::Application) {
             selection.clone(),
             config.clone(),
             sort.clone(),
+            search_status.clone(),
         );
         search.connect_search_changed(move |search| {
+            searching_feedback(search, &search_status);
             generation.set(generation.get().wrapping_add(1));
             workers
                 .borrow()
@@ -411,7 +435,18 @@ pub fn build(app: &adw::Application) {
     window.add_controller(keys);
     settings.set_sensitive(true);
     {
-        let (window, config, workers, model, generation, total, status, info_label, debounce) = (
+        let (
+            window,
+            config,
+            workers,
+            model,
+            generation,
+            total,
+            status,
+            info_label,
+            debounce,
+            search_status,
+        ) = (
             window.downgrade(),
             config.clone(),
             workers.clone(),
@@ -421,10 +456,35 @@ pub fn build(app: &adw::Application) {
             status.clone(),
             info_label.clone(),
             debounce.clone(),
+            search_status.clone(),
         );
         settings.connect_clicked(move |_| {
-            let Some(window) = window.upgrade() else { return; };
-            let (config, workers, model, generation, total, status, info_label, debounce, overlay) = (config.clone(), workers.clone(), model.clone(), generation.clone(), total.clone(), status.clone(), info_label.clone(), debounce.clone(), overlay.clone());
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let (
+                config,
+                workers,
+                model,
+                generation,
+                total,
+                status,
+                info_label,
+                debounce,
+                overlay,
+                search_status,
+            ) = (
+                config.clone(),
+                workers.clone(),
+                model.clone(),
+                generation.clone(),
+                total.clone(),
+                status.clone(),
+                info_label.clone(),
+                debounce.clone(),
+                overlay.clone(),
+                search_status.clone(),
+            );
             let current = config.borrow().clone();
             super::settings::show(&window, &current, move |updated| {
                 if updated.efu_path == config.borrow().efu_path {
@@ -434,38 +494,30 @@ pub fn build(app: &adw::Application) {
                 }
                 let database = match updated.database_path() {
                     Ok(database) => database,
-                    Err(error) => { overlay.add_toast(adw::Toast::new(&format!("缓存路径错误：{error:#}"))); return; }
+                    Err(error) => {
+                        overlay.add_toast(adw::Toast::new(&format!("缓存路径错误：{error:#}")));
+                        return;
+                    }
                 };
-                if let Some(source) = debounce.borrow_mut().take() { source.remove(); }
+                if let Some(source) = debounce.borrow_mut().take() {
+                    source.remove();
+                }
                 generation.set(generation.get().wrapping_add(1));
                 let replacement = Workers::start(updated.clone(), database);
-                replacement.latest.store(generation.get(), std::sync::atomic::Ordering::Relaxed);
+                replacement
+                    .latest
+                    .store(generation.get(), std::sync::atomic::Ordering::Relaxed);
                 *workers.borrow_mut() = replacement;
                 *config.borrow_mut() = updated;
                 total.set(0);
                 model.results(vec![]);
+                search_status.set_text("");
                 info_label.set_text(&format!("索引：{}", config.borrow().efu_path.display()));
                 status.set_text("正在切换索引…");
             });
         });
     }
     let weak_window = window.downgrade();
-    let index_status = Rc::new(RefCell::new(String::from("正在加载本地缓存…")));
-    {
-        let (status, search, index_status) = (status.clone(), search.clone(), index_status.clone());
-        model.connect_items_changed(move |model, _, _, _| {
-            status.set_text(&format!(
-                "{}    显示 {} 条{}",
-                index_status.borrow(),
-                model.n_items(),
-                if search.text().trim().is_empty() {
-                    "（全部索引，按需加载）".to_owned()
-                } else {
-                    "（全部匹配，按需加载）".to_owned()
-                }
-            ));
-        });
-    }
     glib::timeout_add_local(Duration::from_millis(16), move || {
         if weak_window.upgrade().is_none() {
             return glib::ControlFlow::Break;
@@ -477,7 +529,7 @@ pub fn build(app: &adw::Application) {
                     info,
                     changed,
                 } => {
-                    *index_status.borrow_mut() = message;
+                    status.set_text(&message);
                     if let Some(info) = info {
                         total.set(info.count);
                         let updated = chrono::DateTime::from_timestamp(info.built_at, 0)
@@ -499,6 +551,7 @@ pub fn build(app: &adw::Application) {
                         ));
                     }
                     if changed {
+                        searching_feedback(&search, &search_status);
                         refresh(
                             &search,
                             &workers.borrow(),
@@ -509,16 +562,6 @@ pub fn build(app: &adw::Application) {
                             sort.get(),
                         );
                     }
-                    status.set_text(&format!(
-                        "{}    显示 {} 条{}",
-                        index_status.borrow(),
-                        model.n_items(),
-                        if search.text().trim().is_empty() {
-                            "（全部索引，按需加载）".to_owned()
-                        } else {
-                            "（全部匹配，按需加载）".to_owned()
-                        }
-                    ));
                 }
                 Event::Results {
                     generation: received,
@@ -532,17 +575,14 @@ pub fn build(app: &adw::Application) {
                     if model.n_items() > 0 {
                         selection.set_selected(0);
                     }
-                    status.set_text(&format!(
-                        "{}    显示 {} 条（全部匹配，按需加载）",
-                        index_status.borrow(),
-                        model.n_items(),
-                    ));
+                    search_status
+                        .set_text(&format!("“{}”：找到 {count} 条（按需加载）", search.text()));
                 }
                 Event::SearchError {
                     generation: received,
                     message,
                 } if received == generation.get() => {
-                    status.set_text(&message);
+                    search_status.set_text(&message);
                 }
                 Event::Page {
                     generation: received,
@@ -571,4 +611,30 @@ pub fn build(app: &adw::Application) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+#[cfg(test)]
+pub(super) fn test_pending_search_feedback() {
+    // Called by the existing opt-in GUI test, on the same GTK thread.
+    let search = gtk::SearchEntry::new();
+    let feedback = gtk::Label::new(None);
+    let index_status = gtk::Label::new(None);
+    let model = super::virtual_list::VirtualList::new();
+    model.results(vec![Entry::new("/old.txt".into(), None, None, None)]);
+    for text in ["a", "ab", "abc", "ab", "a", "ext:mkv", "path:Anime"] {
+        search.set_text(text);
+        searching_feedback(&search, &feedback);
+        assert!(feedback.text().contains("正在搜索"));
+        assert!(feedback.text().contains("上一次结果"));
+        index_status.set_text("索引最新");
+        assert!(feedback.text().contains("上一次结果"));
+        let row = model
+            .item(0)
+            .and_downcast::<glib::BoxedAnyObject>()
+            .expect("old row");
+        assert_eq!(row.borrow::<Entry>().path, "/old.txt");
+    }
+    search.set_text("");
+    searching_feedback(&search, &feedback);
+    assert_eq!(feedback.text(), "全部索引（按需加载）");
 }

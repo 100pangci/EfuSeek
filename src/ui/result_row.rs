@@ -195,6 +195,7 @@ mod tests {
             return;
         }
         gtk::init().expect("GTK display");
+        super::super::window::test_pending_search_feedback();
         let store = gtk::gio::ListStore::new::<glib::BoxedAnyObject>();
         store.append(&glib::BoxedAnyObject::new(Entry::new(
             "/tmp/opencode/local.txt".into(),

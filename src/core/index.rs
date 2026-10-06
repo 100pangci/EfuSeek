@@ -8,10 +8,11 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, functions::FunctionFlags, params, types::Value};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     fs,
     io::BufReader,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SCHEMA: i64 = 2;
@@ -50,6 +51,16 @@ pub struct Index {
     connection: Connection,
     pub info: IndexInfo,
     legacy: bool,
+    matches_ready: Cell<bool>,
+}
+
+/// Optional diagnostics for the manual benchmark (no timing assertions in CI).
+pub struct SearchPreparation {
+    pub count: u64,
+    pub materialize: Duration,
+    pub total: Duration,
+    /// Logical TEMP database size, not RSS or necessarily bytes written to disk.
+    pub temp_bytes: u64,
 }
 impl Index {
     pub fn needs_upgrade(&self) -> bool {
@@ -155,6 +166,7 @@ impl Index {
             connection,
             info,
             legacy: version == 1,
+            matches_ready: Cell::new(false),
         })
     }
     pub fn search(&self, query: &Query, limit: usize) -> Result<Vec<Entry>> {
@@ -176,16 +188,49 @@ impl Index {
 
     /// Materialize only ordered row IDs. The same connection/inode serves count and pages.
     pub fn prepare_search(&self, query: &Query, sort: Sort) -> Result<u64> {
+        self.materialize_search(query, sort).map(|(count, _)| count)
+    }
+
+    pub fn prepare_search_measured(&self, query: &Query, sort: Sort) -> Result<SearchPreparation> {
+        let start = Instant::now();
+        let (count, materialize) = self.materialize_search(query, sort)?;
+        let total = start.elapsed();
+        let pages: u64 = self
+            .connection
+            .pragma_query_value(Some("temp"), "page_count", |r| r.get(0))?;
+        let size: u64 = self
+            .connection
+            .pragma_query_value(Some("temp"), "page_size", |r| r.get(0))?;
+        Ok(SearchPreparation {
+            count,
+            materialize,
+            total,
+            temp_bytes: pages * size,
+        })
+    }
+
+    fn materialize_search(&self, query: &Query, sort: Sort) -> Result<(u64, Duration)> {
+        // DDL can itself fail/be interrupted before dropping an old table. Never
+        // expose that table, or an empty rolled-back INSERT, as a valid result.
+        self.matches_ready.set(false);
         self.connection.execute_batch("DROP TABLE IF EXISTS temp.matches; CREATE TEMP TABLE matches(position INTEGER PRIMARY KEY,entry_id INTEGER NOT NULL);")?;
         let (from, order, values) = self.search_sql(query, sort);
+        let start = Instant::now();
+        // SQLite's implicit statement transaction rolls back ALL inserted IDs
+        // on SQLITE_INTERRUPT/error; an additional transaction is unnecessary.
         self.connection.execute(
             &format!("INSERT INTO temp.matches(entry_id) SELECT e.id {from} ORDER BY {order}"),
             rusqlite::params_from_iter(values),
         )?;
-        Ok(self.connection.changes())
+        let elapsed = start.elapsed();
+        self.matches_ready.set(true);
+        Ok((self.connection.changes(), elapsed))
     }
 
     pub fn search_page(&self, offset: u32, limit: u32) -> Result<Vec<Entry>> {
+        if !self.matches_ready.get() {
+            bail!("搜索结果尚未准备完成，请重新搜索");
+        }
         let mut statement = self.connection.prepare("SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM temp.matches m JOIN entries e ON e.id=m.entry_id WHERE m.position>?1 ORDER BY m.position LIMIT ?2")?;
         let rows = statement.query_map(params![offset, limit.min(1024)], read_entry)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -367,6 +412,237 @@ pub fn rebuild_stamped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    fn audit_index(dir: &Path) -> Result<Index> {
+        let source = dir.join("audit.efu");
+        let db = dir.join("index.sqlite");
+        let mut data = String::from("Filename\n");
+        for n in 0..10_000 {
+            data.push_str(&format!("/Anime/abc{n:05}.mkv\n"));
+        }
+        fs::write(&source, data)?;
+        rebuild(&source, &db)?;
+        Index::open(&db)
+    }
+
+    #[test]
+    fn interrupted_insert_rolls_back_and_next_search_recovers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = audit_index(dir.path())?;
+        for (text, field) in ["a", "ab", "abc", "ab", "a", "", "ext:mkv", "path:Anime"]
+            .into_iter()
+            .flat_map(|text| {
+                [SortField::Name, SortField::Size, SortField::Modified].map(|field| (text, field))
+            })
+        {
+            let inserted = Arc::new(AtomicU64::new(0));
+            let counter = inserted.clone();
+            index.connection.update_hook(Some(
+                move |_: rusqlite::hooks::Action, db: &str, table: &str, _: i64| {
+                    if db == "temp" && table == "matches" {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+            ));
+            let counter = inserted.clone();
+            index
+                .connection
+                .progress_handler(100, Some(move || counter.load(Ordering::Relaxed) >= 512));
+            let sort = Sort {
+                field,
+                direction: SortDirection::Descending,
+            };
+            assert!(
+                index.prepare_search(&Query::parse(text), sort).is_err(),
+                "{text}"
+            );
+            assert!(
+                inserted.load(Ordering::Relaxed) >= 512,
+                "cancel after actual writes"
+            );
+            index.connection.progress_handler(0, None::<fn() -> bool>);
+            index
+                .connection
+                .update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
+            let count: u64 =
+                index
+                    .connection
+                    .query_row("SELECT count(*) FROM temp.matches", [], |r| r.get(0))?;
+            assert_eq!(count, 0, "SQLite statement rollback, not partial IDs");
+            assert!(
+                index.search_page(0, 1).is_err(),
+                "failed result is not valid"
+            );
+            assert_eq!(index.prepare_search(&Query::parse(text), sort)?, 10_000);
+            assert_eq!(index.search_page(9999, 1)?.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn temp_creation_failure_invalidates_old_results_and_recovers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = audit_index(dir.path())?;
+        assert_eq!(
+            index.prepare_search(&Query::parse("a"), Sort::default())?,
+            10_000
+        );
+        index.connection.pragma_update(None, "query_only", true)?;
+        assert!(
+            index
+                .prepare_search(&Query::parse("missing"), Sort::default())
+                .is_err()
+        );
+        assert!(index.search_page(0, 1).is_err());
+        assert_eq!(
+            index
+                .connection
+                .query_row("SELECT count(*) FROM temp.matches", [], |r| r
+                    .get::<_, u64>(0))?,
+            10_000,
+            "failed DROP leaves old IDs, but they are inaccessible"
+        );
+        index.connection.pragma_update(None, "query_only", false)?;
+        assert_eq!(
+            index.prepare_search(&Query::parse("abc00001"), Sort::default())?,
+            1
+        );
+        assert_eq!(index.search_page(0, 1)?[0].name, "abc00001.mkv");
+        // Verify ID-only schema and indexed position range (no deep OFFSET).
+        let mut columns = index
+            .connection
+            .prepare("PRAGMA temp.table_info(matches)")?;
+        let columns = columns
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(columns, ["position", "entry_id"]);
+        let plan: String = index.connection.query_row("EXPLAIN QUERY PLAN SELECT entry_id FROM temp.matches WHERE position>9000 ORDER BY position LIMIT 128", [], |r| r.get(3))?;
+        assert!(plan.contains("INTEGER PRIMARY KEY"), "{plan}");
+        Ok(())
+    }
+
+    #[test]
+    fn generation_change_during_insert_interrupts_and_recovers() -> Result<()> {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir()?;
+        let index = audit_index(dir.path())?;
+        let latest = Arc::new(AtomicU64::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = latest.clone();
+        index.connection.update_hook(Some(
+            move |_: rusqlite::hooks::Action, db: &str, table: &str, id: i64| {
+                if db == "temp" && table == "matches" && id == 512 {
+                    next.store(2, Ordering::Relaxed);
+                }
+            },
+        ));
+        index.set_cancellation(latest.clone(), 1, stop.clone());
+        assert!(
+            index
+                .prepare_search(&Query::parse("a"), Sort::default())
+                .is_err()
+        );
+        assert_eq!(latest.load(Ordering::Relaxed), 2);
+        index
+            .connection
+            .update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
+        index.set_cancellation(latest, 2, stop);
+        assert!(index.search_page(0, 1).is_err());
+        assert_eq!(
+            index.prepare_search(&Query::parse("abc00001"), Sort::default())?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn temp_full_rolls_back_and_recovers_without_reopening() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = audit_index(dir.path())?;
+        index
+            .connection
+            .pragma_update(Some("temp"), "max_page_count", 2)?;
+        let error = index
+            .prepare_search(&Query::parse("a"), Sort::default())
+            .expect_err("TEMP quota must fail");
+        assert!(
+            matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::DiskFull)
+        );
+        assert!(!index.matches_ready.get());
+        assert_eq!(
+            index
+                .connection
+                .query_row("SELECT count(*) FROM temp.matches", [], |r| r
+                    .get::<_, u64>(0))?,
+            0
+        );
+        index
+            .connection
+            .pragma_update(Some("temp"), "max_page_count", 100_000)?;
+        assert_eq!(
+            index.prepare_search(&Query::parse("a"), Sort::default())?,
+            10_000
+        );
+        assert_eq!(index.search_page(9999, 1)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_temp_is_unlinked_even_after_abrupt_exit() -> Result<()> {
+        const CHILD: &str = "EFUSEEK_TEMP_AUDIT_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let index = audit_index(&root)?;
+            index
+                .connection
+                .pragma_update(Some("temp"), "cache_size", 1)?;
+            index.prepare_search(&Query::parse("a"), Sort::default())?;
+            let mut found = false;
+            for entry in fs::read_dir("/proc/self/fd")? {
+                if let Ok(target) = fs::read_link(entry?.path())
+                    && target.to_string_lossy().contains("etilqs")
+                {
+                    assert!(target.to_string_lossy().ends_with(" (deleted)"));
+                    assert!(target.starts_with(root.join("sqlite-temp")));
+                    found = true;
+                }
+            }
+            assert!(found, "force FILE backing rather than only memory cache");
+            fs::write(root.join("ready"), "ready")?;
+            loop {
+                std::thread::park();
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let temp = dir.path().join("sqlite-temp");
+        fs::create_dir(&temp)?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "core::index::tests::disk_temp_is_unlinked_even_after_abrupt_exit",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .env("SQLITE_TMPDIR", &temp)
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("ready").exists() && Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready = dir.path().join("ready").exists();
+        let _ = child.kill(); // SIGKILL only our isolated test child, no destructors.
+        child.wait()?;
+        assert!(ready, "child did not verify TEMP backing");
+        assert_eq!(fs::read_dir(temp)?.count(), 0, "no persistent TEMP garbage");
+        Ok(())
+    }
     #[test]
     fn query_filters_literals_and_ranking() -> Result<()> {
         let dir = tempfile::tempdir()?;

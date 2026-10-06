@@ -165,6 +165,10 @@ impl VirtualList {
         imp.pages.borrow_mut().insert(offset, rows);
         {
             let mut order = imp.order.borrow_mut();
+            // The initial result page can also arrive through a lazy request.
+            // Count each cached offset once, otherwise duplicate replies evict
+            // a still-current page and reduce the effective cache capacity.
+            order.retain(|cached| *cached != offset);
             order.push_back(offset);
             while order.len() > imp.max_pages.get() {
                 if let Some(oldest) = order.pop_front() {
@@ -196,6 +200,8 @@ mod tests {
         model.page(2, 0, vec![Entry::new("/stale".into(), None, None, None)]);
         assert!(model.imp().pages.borrow().is_empty());
         model.page(3, 0, vec![Entry::new("/fresh".into(), None, None, None)]);
+        model.page(3, 0, vec![Entry::new("/fresh".into(), None, None, None)]);
+        assert_eq!(model.imp().order.borrow().len(), 1);
         let item = model
             .item(0)
             .and_downcast::<glib::BoxedAnyObject>()

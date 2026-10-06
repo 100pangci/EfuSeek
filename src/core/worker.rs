@@ -197,7 +197,7 @@ impl Workers {
                     {
                         break;
                     }
-                    for _ in 0..config.poll_seconds * 10 {
+                    for _ in 0..poll_delay(config.poll_seconds, waiting) * 10 {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
@@ -213,6 +213,7 @@ impl Workers {
                 let mut cached: Option<Index> = None;
                 let mut seen_revision = u64::MAX;
                 let mut prepared_generation = None;
+                let mut snapshot_generation = None;
                 while !stop.load(Ordering::Relaxed) {
                     // Search preparation and page reads share one connection so that an
                     // atomic cache replacement cannot mix a result count with another inode.
@@ -224,6 +225,7 @@ impl Workers {
                             continue;
                         }
                         prepared_generation = None;
+                        snapshot_generation = None;
                         let now = revision.load(Ordering::Acquire);
                         let result = (|| -> anyhow::Result<(u64, Vec<Entry>)> {
                             if cached.is_none() || now != seen_revision {
@@ -254,6 +256,7 @@ impl Workers {
                         let event = match result {
                             Ok((count, entries)) => {
                                 prepared_generation = Some(request.generation);
+                                snapshot_generation = Some(request.generation);
                                 Event::Results {
                                     generation: request.generation,
                                     count,
@@ -280,18 +283,22 @@ impl Workers {
                     if latest.load(Ordering::Relaxed) != request.generation {
                         continue;
                     }
+                    // Pages queued before preparation, or after a failed search,
+                    // are not evidence of cache corruption. Only a successful
+                    // preparation can authorize reads of this generation.
+                    if request.searching && prepared_generation != Some(request.generation) {
+                        continue;
+                    }
                     let now = revision.load(Ordering::Acquire);
                     let result = (|| -> anyhow::Result<Vec<Entry>> {
-                        if request.searching && prepared_generation != Some(request.generation) {
-                            anyhow::bail!("搜索结果已失效，请重新搜索");
-                        }
                         if cached.is_none()
                             || (now != seen_revision
-                                && prepared_generation != Some(request.generation))
+                                && snapshot_generation != Some(request.generation))
                         {
                             cached = Some(Index::open(&db)?);
                             seen_revision = now;
                             prepared_generation = None;
+                            snapshot_generation = None;
                         }
                         match cached.as_ref() {
                             Some(index) => {
@@ -315,11 +322,14 @@ impl Workers {
                         continue;
                     }
                     let event = match result {
-                        Ok(entries) => Event::Page {
-                            generation: request.generation,
-                            offset: request.offset,
-                            entries,
-                        },
+                        Ok(entries) => {
+                            snapshot_generation = Some(request.generation);
+                            Event::Page {
+                                generation: request.generation,
+                                offset: request.offset,
+                                entries,
+                            }
+                        }
                         Err(error) => {
                             cached = None;
                             repair.store(true, Ordering::Relaxed);
@@ -345,11 +355,18 @@ impl Workers {
     }
 }
 
+fn poll_delay(seconds: u64, waiting: bool) -> u64 {
+    if waiting { seconds.min(1) } else { seconds }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn consecutive_stamps_only_and_errors_reset() {
+        assert_eq!(poll_delay(5, true), 1);
+        assert_eq!(poll_delay(5, false), 5);
+        assert_eq!(poll_delay(1, true), 1);
         let mut gate = Stability::default();
         let mut stamp = SourceStamp {
             path: "/test.efu".into(),
