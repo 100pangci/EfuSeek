@@ -123,8 +123,10 @@ TOML 单引号字符串不用转义反斜线。映射按最长且有目录边界
 
 | 操作 | 功能 |
 | --- | --- |
-| 空搜索 | 按 EFU 原始顺序浏览完整索引，按需分页加载 |
+| 空搜索 | 默认按 EFU 原始顺序浏览完整索引，按需分页加载；列头排序同样适用 |
 | 输入普通文本 | 任意子串搜索，默认最多 500 条 |
+| 点击名称 / 大小 / 修改时间列头 | SQLite 升序排序，再次点击切换降序 |
+| 右键结果行 | 先选中该行，再打开原生菜单：打开、打开所在目录、复制文件名、本机完整路径、EFU 原始路径 |
 | Ctrl+L / Ctrl+F | 聚焦搜索框 |
 | ↑ / ↓ | 选择结果 |
 | Enter / 双击 | 打开所选文件或目录 |
@@ -136,6 +138,21 @@ TOML 单引号字符串不用转义反斜线。映射按最长且有目录边界
 
 名称完全匹配、名称开头、名称包含、路径包含依次排序。`erasmus` 可匹配 `Kiriue_no_Erasmus`、`erasmus.exe` 或目录路径里的该片段。百分号、下划线、引号按字面字符处理。目录显示 📁，文件显示 📄，目录不显示大小。
 
+### 查询语法（下一版增量功能，尚未发布）
+
+| 查询 | 语义 |
+| --- | --- |
+| `ext:mkv` / `ext:.mkv` | 仅文件，扩展名完全匹配，忽略开头的点 |
+| `file:test` | 仅文件，名称包含 `test` |
+| `folder:anime` | 仅目录，名称包含 `anime` |
+| `path:galgame` | EFU 原始完整路径包含 `galgame`（不是本机映射路径） |
+
+可组合，例如 `erasmus ext:zip`、`file:patch path:Galgame`、`folder:Anime`；各条件为 AND，忽略大小写，支持中文和日文。`file:` / `folder:` 可仅限定类型。未识别的 `foo:bar` 当普通文本处理。普通多词搜索仍是一段字面子串；与过滤器组合时，普通文本片段以空格连接。当前不支持引号分组、正则或完整 Everything 语言；引号、`%`、`_`、`\` 均按字面字符处理。所有值通过 SQL 参数绑定传递，长子串保留 FTS5 trigram 加速，1–2 字符条件回退 LIKE。
+
+列表为“名称 | 大小 | 修改时间 | 本机路径”。Date Modified 按 Everything EFU 的 **Windows FILETIME**（从 1601-01-01 UTC 起的 100 纳秒计数）解析，按本机时区显示；缺失或无效时留空。列头排序显式覆盖搜索相关度排序；未点击排序时保留原有相关度和 EFU 浏览顺序。未知大小、目录大小、无效时间在升降序中均排在最后，以 id 作最终稳定 tie-breaker。
+
+排序完全在后台 SQLite 中执行，空搜索仍只请求有界分页，GTK 不安装全量内存排序模型。新缓存具有排序索引；旧 v0.1.0 缓存离线仍能搜索/排序（排序可能较慢），来源恢复并稳定后自动原子重建升级。右键“打开所在目录”对文件夹打开其父目录。复制使用 GTK 剪贴板，不调用 shell；未映射的 Windows / UNC 路径仍可复制原始路径，本机路径复制项禁用并标注未配置映射。
+
 ## 实现
 
 ```text
@@ -143,10 +160,11 @@ src/
 ├── main.rs / app.rs        原生应用入口
 ├── config.rs              TOML 默认值、XDG、保存与备份
 ├── core/
-│   ├── entry.rs            元数据、路径拆分、大小显示
+│   ├── entry.rs            元数据、路径拆分、大小和 FILETIME 显示
 │   ├── efu.rs              流式 UTF-8 CSV 解析
 │   ├── index.rs            SQLite / FTS5、原子缓存替换、分页
 │   ├── query.rs            Query Parser 和字面查询转义
+│   ├── sort.rs             SQLite 排序字段和方向
 │   ├── path_map.rs         独立路径映射
 │   ├── opener.rs           GIO 异步检查与默认应用启动
 │   └── worker.rs           索引、搜索与分页后台线程
@@ -162,14 +180,16 @@ Core 解析、搜索及映射不依赖 GTK；可运行 `cargo test --no-default-
 
 后台在缓存目录创建新数据库，提交并校验后原子 rename；读取前后 EFU 属性变化则拒绝替换。更新失败保留缓存和当前结果。旧读取连接保留旧 inode，更新完成后打开新连接。搜索采用请求代数和 SQLite progress handler 取消过期查询。
 
+发现 EFU 的 mtime / size 与缓存不同后，只检查属性，显示“检测到索引更新，等待文件写入完成…”。**连续两次 `poll_seconds` 轮询得到相同 SourceStamp** 才开始完整读取（默认间隔 5 秒，首次建索引也适用）。变化、离线或属性读取失败会重新开始稳定计数，旧缓存保持可用。开始重建前再确认 stamp 仍等于已稳定值，保留构建前后 stamp 校验、完整性校验和原子替换作为第二道保护。不添加 watcher，不遍历 NAS。
+
 ## 限制
 
 - trigram 至少需要 3 个 Unicode 字符；1–2 字符搜索回退后台 SQL，百万条目时较慢，但可取消。
-- 仅支持普通文本；`ext:`、`folder:` 等语法暂未实现。
+- 只支持普通文本和上述四种简单过滤器，不实现完整 Everything parser。
 - 只比较 mtime + 大小；两者不变的内容更新无法检测。SMB 属性缓存可能延迟可见性。生成端应写临时 EFU 后原子替换。
 - 索引构建需要旧/新数据库共存的空间；强制退出可能留下 `build-*.sqlite`，关闭应用后可仅清理这些临时文件。
 - `Filename` 必须存在；Size、Date Modified、Attributes 可缺省。目录由 Attributes 的 `0x10` 位或末尾分隔符判断，无字段时不访问 NAS 来猜测。
-- 坏行、非 UTF-8 行跳过并记录日志；坏数字按未知元数据处理。Date Modified 保存原值，暂不展示。
+- 坏行、非 UTF-8 行跳过并记录日志；坏数字按未知元数据处理。Date Modified 保留原值，不能解析为 FILETIME 时显示空白。
 - Windows 与 Linux 文件名大小写不同；映射不自动修正实际文件名大小写。
 - 暂不同时搜索多个 EFU，不生成索引，不调整挂载或网络。
 
@@ -179,6 +199,11 @@ Core 解析、搜索及映射不依赖 GTK；可运行 `cargo test --no-default-
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --no-default-features
+
+# 可选 GUI 行菜单 / 剪贴板 / 原生列头测试（隔离显示）
+EFUSEEK_GUI_TEST=1 GDK_BACKEND=x11 GTK_A11Y=none GSK_RENDERER=cairo \
+  xvfb-run -a cargo test --bin efuseek -- --test-threads=1
 
 # 可选：读取指定 EFU 并输出构建/查询耗时，不访问索引中的目标文件
 cargo run --release --example check_index -- \

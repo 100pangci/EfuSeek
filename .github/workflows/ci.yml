@@ -46,6 +46,10 @@ jobs:
         run: cargo test --locked --all-features
       - name: Core without GTK
         run: cargo test --locked --no-default-features
+      - name: Native GTK headers and context menu
+        run: |
+          EFUSEEK_GUI_TEST=1 GDK_BACKEND=x11 GTK_A11Y=none GSK_RENDERER=cairo \
+            xvfb-run -a dbus-run-session -- cargo test --locked --bin efuseek -- --test-threads=1
       - name: Native window smoke test
         run: |
           cargo build --locked

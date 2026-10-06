@@ -12,7 +12,7 @@ anyhow = "1"
 csv = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
-rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.37", features = ["bundled", "hooks", "functions"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_12"], optional = true }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_4"], optional = true }
 log = "0.4"

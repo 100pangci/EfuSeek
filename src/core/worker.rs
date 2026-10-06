@@ -4,6 +4,7 @@ use crate::{
         entry::Entry,
         index::{self, Index, IndexInfo, SourceStamp},
         query::Query,
+        sort::Sort,
     },
 };
 use std::{
@@ -41,10 +42,12 @@ pub struct PageRequest {
     pub generation: u64,
     pub offset: u32,
     pub limit: u32,
+    pub sort: Sort,
 }
 pub struct SearchRequest {
     pub generation: u64,
     pub text: String,
+    pub sort: Sort,
 }
 pub struct Workers {
     pub search: Sender<SearchRequest>,
@@ -52,6 +55,22 @@ pub struct Workers {
     pub pages: Sender<PageRequest>,
     pub latest: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+}
+
+/// Only metadata is read while the source is changing. Errors break consecutiveness.
+#[derive(Default)]
+struct Stability {
+    candidate: Option<SourceStamp>,
+}
+impl Stability {
+    fn observe(&mut self, stamp: SourceStamp) -> bool {
+        let stable = self.candidate.as_ref() == Some(&stamp);
+        self.candidate = Some(stamp);
+        stable
+    }
+    fn reset(&mut self) {
+        self.candidate = None;
+    }
 }
 impl Drop for Workers {
     fn drop(&mut self) {
@@ -102,8 +121,10 @@ impl Workers {
                 {
                     log::warn!("旧缓存迁移失败，将重新构建：{error}");
                 }
+                let mut upgrade = false;
                 let mut current = match Index::open(&db) {
                     Ok(index) => {
+                        upgrade = index.needs_upgrade();
                         let info = index.info;
                         let _ = send.send(Event::Status {
                             message: "缓存已就绪，正在检查 EFU…".into(),
@@ -117,25 +138,35 @@ impl Workers {
                         None
                     }
                 };
+                let mut stability = Stability::default();
                 while !stop.load(Ordering::Relaxed) {
+                    let mut waiting = false;
                     let result = SourceStamp::read(&config.efu_path).and_then(|stamp| {
                         if current.as_ref().is_some_and(|i| i.source == stamp)
                             && !repair.load(Ordering::Relaxed)
+                            && !upgrade
                         {
+                            stability.reset();
                             return Ok(None);
                         }
+                        if !stability.observe(stamp.clone()) {
+                            waiting = true;
+                            return Ok(None);
+                        }
+                        stability.reset();
                         let _ = send.send(Event::Status {
                             message: "正在更新索引…".into(),
                             info: current.clone(),
                             changed: false,
                         });
-                        index::rebuild(&config.efu_path, &db).map(Some)
+                        index::rebuild_stamped(&config.efu_path, &db, Some(&stamp)).map(Some)
                     });
                     let (message, changed) = match result {
                         Ok(Some(info)) => {
                             let skipped = info.skipped;
                             current = Some(info);
                             repair.store(false, Ordering::Relaxed);
+                            upgrade = false;
                             revision.fetch_add(1, Ordering::Release);
                             (
                                 if skipped > 0 {
@@ -146,8 +177,10 @@ impl Workers {
                                 true,
                             )
                         }
+                        Ok(None) if waiting => ("检测到索引更新，等待文件写入完成…".into(), false),
                         Ok(None) => ("索引最新".into(), false),
                         Err(error) => {
+                            stability.reset();
                             log::warn!("更新索引失败: {error:#}");
                             (format!("索引更新失败：{error:#}（保留缓存）"), false)
                         }
@@ -204,7 +237,11 @@ impl Workers {
                                     request.generation,
                                     stop.clone(),
                                 );
-                                index.search(&Query::parse(&request.text), config.result_limit)
+                                index.search_sorted(
+                                    &Query::parse(&request.text),
+                                    config.result_limit,
+                                    request.sort,
+                                )
                             }
                             None => anyhow::bail!("暂无可用索引"),
                         }
@@ -254,7 +291,14 @@ impl Workers {
                             seen_revision = now;
                         }
                         match cached.as_ref() {
-                            Some(index) => index.browse(request.offset, request.limit),
+                            Some(index) => {
+                                index.set_cancellation(
+                                    latest.clone(),
+                                    request.generation,
+                                    stop.clone(),
+                                );
+                                index.browse_sorted(request.offset, request.limit, request.sort)
+                            }
                             None => anyhow::bail!("暂无可用索引"),
                         }
                     })();
@@ -289,5 +333,29 @@ impl Workers {
             latest,
             stop,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn consecutive_stamps_only_and_errors_reset() {
+        let mut gate = Stability::default();
+        let mut stamp = SourceStamp {
+            path: "/test.efu".into(),
+            size: 1,
+            modified_ns: "1".into(),
+        };
+        for size in 1..10 {
+            stamp.size = size;
+            assert!(!gate.observe(stamp.clone()));
+        }
+        assert!(gate.observe(stamp.clone()));
+        gate.reset();
+        assert!(!gate.observe(stamp.clone()));
+        assert!(gate.observe(stamp.clone()));
+        stamp.modified_ns = "2".into();
+        assert!(!gate.observe(stamp));
     }
 }

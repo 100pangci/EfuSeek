@@ -5,6 +5,7 @@ use efuseek::{
         entry::Entry,
         opener,
         path_map::map_path,
+        sort::{Sort, SortDirection, SortField},
         worker::{Event, SearchRequest, Workers},
     },
 };
@@ -30,6 +31,7 @@ fn refresh(
     model: &super::virtual_list::VirtualList,
     selection: &gtk::SingleSelection,
     total: u64,
+    sort: Sort,
 ) {
     generation.set(generation.get().wrapping_add(1));
     workers
@@ -39,12 +41,13 @@ fn refresh(
         // Detach before a whole-model reset: GtkSingleSelection otherwise tries
         // to locate the old selected object's identity across the entire index.
         selection.set_model(None::<&gtk::gio::ListModel>);
-        model.browse(total, generation.get(), workers.pages.clone());
+        model.browse(total, generation.get(), workers.pages.clone(), sort);
         selection.set_model(Some(model));
     } else {
         let _ = workers.search.send(SearchRequest {
             generation: generation.get(),
             text: search.text().to_string(),
+            sort,
         });
     }
 }
@@ -93,20 +96,56 @@ pub fn build(app: &adw::Application) {
     search.set_search_delay(0);
     content.append(&search);
     let model = super::virtual_list::VirtualList::new();
+    // Shared by row factories; populated after loading config, before rows are bound.
+    let menu_config = Rc::new(RefCell::new(Config::default()));
     let selection = gtk::SingleSelection::new(Some(model.clone()));
     selection.set_autoselect(false);
     selection.set_can_unselect(true);
     let view = gtk::ColumnView::new(Some(selection.clone()));
     view.set_single_click_activate(false);
     view.set_show_column_separators(true);
-    let name = super::result_row::column("名称", false, |e| {
-        format!("{} {}", if e.is_dir { "📁" } else { "📄" }, e.name)
-    });
+    let context_menu: super::result_row::ContextMenu = {
+        let (selection, config, overlay) = (
+            selection.downgrade(),
+            menu_config.clone(),
+            overlay.downgrade(),
+        );
+        Rc::new(move |item, label, x, y| {
+            if let (Some(selection), Some(overlay)) = (selection.upgrade(), overlay.upgrade()) {
+                super::result_row::show_context_menu(
+                    item,
+                    label,
+                    &selection,
+                    &config.borrow(),
+                    &overlay,
+                    (x, y),
+                );
+            }
+        })
+    };
+    let name = super::result_row::column(
+        "名称",
+        false,
+        |e| format!("{} {}", if e.is_dir { "📁" } else { "📄" }, e.name),
+        context_menu.clone(),
+    );
     name.set_fixed_width(300);
     view.append_column(&name);
-    let size = super::result_row::column("大小", false, Entry::display_size);
+    let size = super::result_row::column("大小", false, Entry::display_size, context_menu.clone());
     size.set_fixed_width(110);
     view.append_column(&size);
+    let modified = super::result_row::column(
+        "修改时间",
+        false,
+        Entry::display_modified,
+        context_menu.clone(),
+    );
+    modified.set_fixed_width(180);
+    view.append_column(&modified);
+    // These sorters only enable native header interactions. No SortListModel is installed.
+    for column in [&name, &size, &modified] {
+        column.set_sorter(Some(&gtk::CustomSorter::new(|_, _| gtk::Ordering::Equal)));
+    }
     // The path column is installed below after loading the current mapping configuration.
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -137,7 +176,10 @@ pub fn build(app: &adw::Application) {
     search.grab_focus();
 
     let config = match Config::load() {
-        Ok(config) => Rc::new(RefCell::new(config)),
+        Ok(config) => {
+            *menu_config.borrow_mut() = config;
+            menu_config
+        }
         Err(error) => {
             status.set_text(&format!("配置加载失败：{error:#}"));
             return;
@@ -157,14 +199,19 @@ pub fn build(app: &adw::Application) {
     );
     {
         let config = config.clone();
-        view.append_column(&super::result_row::column("本机路径", true, move |e| {
-            if e.path.is_empty() {
-                return String::new();
-            }
-            map_path(&e.path, &config.borrow().path_map)
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| format!("{}（未映射）", e.path))
-        }));
+        view.append_column(&super::result_row::column(
+            "本机路径",
+            true,
+            move |e| {
+                if e.path.is_empty() {
+                    return String::new();
+                }
+                map_path(&e.path, &config.borrow().path_map)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| format!("{}（未映射）", e.path))
+            },
+            context_menu,
+        ));
     }
     info_label.set_text(&if config.borrow().efu_path.as_os_str().is_empty() {
         "索引：未选择".into()
@@ -178,9 +225,50 @@ pub fn build(app: &adw::Application) {
     )));
     let generation = Rc::new(Cell::new(0_u64));
     let total = Rc::new(Cell::new(0_u64));
+    let sort = Rc::new(Cell::new(Sort::default()));
+    {
+        let (workers, generation, model, selection, total, search, sort) = (
+            workers.clone(),
+            generation.clone(),
+            model.clone(),
+            selection.clone(),
+            total.clone(),
+            search.clone(),
+            sort.clone(),
+        );
+        if let Some(sorter) = view.sorter().and_downcast::<gtk::ColumnViewSorter>() {
+            sorter.connect_changed(move |sorter, _| {
+                let field = match sorter.primary_sort_column() {
+                    Some(column) if column == name => SortField::Name,
+                    Some(column) if column == size => SortField::Size,
+                    Some(column) if column == modified => SortField::Modified,
+                    _ => SortField::Default,
+                };
+                let next = Sort {
+                    field,
+                    direction: if sorter.primary_sort_order() == gtk::SortType::Descending {
+                        SortDirection::Descending
+                    } else {
+                        SortDirection::Ascending
+                    },
+                };
+                if sort.replace(next) != next {
+                    refresh(
+                        &search,
+                        &workers.borrow(),
+                        &generation,
+                        &model,
+                        &selection,
+                        total.get(),
+                        next,
+                    );
+                }
+            });
+        }
+    }
     let debounce = Rc::new(RefCell::new(None::<glib::SourceId>));
     {
-        let (workers, generation, debounce, total, model, selection, config) = (
+        let (workers, generation, debounce, total, model, selection, config, sort) = (
             workers.clone(),
             generation.clone(),
             debounce.clone(),
@@ -188,6 +276,7 @@ pub fn build(app: &adw::Application) {
             model.clone(),
             selection.clone(),
             config.clone(),
+            sort.clone(),
         );
         search.connect_search_changed(move |search| {
             generation.set(generation.get().wrapping_add(1));
@@ -198,7 +287,7 @@ pub fn build(app: &adw::Application) {
             if let Some(source) = debounce.borrow_mut().take() {
                 source.remove();
             }
-            let (workers, search, generation, pending, model, total, selection) = (
+            let (workers, search, generation, pending, model, total, selection, sort) = (
                 workers.clone(),
                 search.clone(),
                 generation.clone(),
@@ -206,6 +295,7 @@ pub fn build(app: &adw::Application) {
                 model.clone(),
                 total.clone(),
                 selection.clone(),
+                sort.clone(),
             );
             *debounce.borrow_mut() = Some(glib::timeout_add_local_once(
                 Duration::from_millis(config.borrow().debounce_ms),
@@ -218,6 +308,7 @@ pub fn build(app: &adw::Application) {
                         &model,
                         &selection,
                         total.get(),
+                        sort.get(),
                     );
                 },
             ));
@@ -416,6 +507,7 @@ pub fn build(app: &adw::Application) {
                             &model,
                             &selection,
                             total.get(),
+                            sort.get(),
                         );
                     }
                     status.set_text(&format!(

@@ -28,6 +28,7 @@ fn search(workers: &Workers, generation: u64, text: &str) -> Result<Event> {
     workers.search.send(SearchRequest {
         generation,
         text: text.into(),
+        sort: Default::default(),
     })?;
     wait(
         workers,
@@ -59,6 +60,7 @@ fn automatic_update_preserves_cache_on_failure() -> Result<()> {
         generation: 4,
         offset: 0,
         limit: 512,
+        sort: Default::default(),
     })?;
     let page = wait(&workers, |e| matches!(e, Event::Page { generation: 4, .. }))?;
     assert!(matches!(page, Event::Page { entries, .. } if entries.len() == 1 && entries[0].is_dir));
@@ -88,6 +90,8 @@ fn offline_start_searches_existing_cache() -> Result<()> {
     let db = directory.path().join("cache.sqlite");
     fs::write(&source, "Filename\n/offline.txt\n")?;
     rebuild(&source, &db)?;
+    // Simulate a genuine v0.1.0 schema rather than only a legacy cache filename.
+    rusqlite::Connection::open(&db)?.execute_batch("DROP INDEX entries_size_key_ASC; DROP INDEX entries_size_key_DESC; DROP INDEX entries_modified_key_ASC; DROP INDEX entries_modified_key_DESC; ALTER TABLE entries DROP COLUMN size_key; ALTER TABLE entries DROP COLUMN modified_key; PRAGMA user_version=1;")?;
     fs::remove_file(&source)?;
     let workers = Workers::start(
         Config {
@@ -142,6 +146,77 @@ fn legacy_cache_migrates_without_accessing_source() -> Result<()> {
     assert!(!legacy.exists());
     assert!(
         matches!(search(&workers, 1, "offline")?, Event::Results { entries, .. } if entries.len() == 1)
+    );
+    Ok(())
+}
+
+#[test]
+fn growing_source_waits_without_replacing_old_index() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("growing.efu");
+    let db = directory.path().join("index.sqlite");
+    fs::write(&source, "Filename\n/old.txt\n")?;
+    rebuild(&source, &db)?;
+    let workers = Workers::start(
+        Config {
+            efu_path: source.clone(),
+            poll_seconds: 1,
+            ..Config::default()
+        },
+        db.clone(),
+    );
+    wait(&workers, |e| {
+        matches!(e, Event::Status { changed: true, .. })
+    })?;
+    for count in 1..=3 {
+        let data = format!(
+            "Filename\n{}",
+            (0..count)
+                .map(|n| format!("/new{n}.txt\n"))
+                .collect::<String>()
+        );
+        fs::write(&source, data)?;
+        wait(
+            &workers,
+            |e| matches!(e, Event::Status { message, .. } if message.contains("等待文件写入完成")),
+        )?;
+        assert_eq!(
+            efuseek::core::index::Index::open(&db)?.browse(0, 10)?[0].name,
+            "old.txt"
+        );
+        assert!(
+            matches!(search(&workers, count, "old")?, Event::Results { entries, .. } if entries.len() == 1)
+        );
+    }
+    wait(
+        &workers,
+        |e| matches!(e, Event::Status { changed: true, info: Some(i), .. } if i.count == 3),
+    )?;
+    assert!(
+        matches!(search(&workers, 4, "new")?, Event::Results { entries, .. } if entries.len() == 3)
+    );
+    let sort = efuseek::core::sort::Sort {
+        field: efuseek::core::sort::SortField::Name,
+        direction: efuseek::core::sort::SortDirection::Descending,
+    };
+    workers.latest.store(5, Ordering::Relaxed);
+    workers.pages.send(PageRequest {
+        generation: 5,
+        offset: 0,
+        limit: 1,
+        sort,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Page { generation: 5, .. }))?, Event::Page { entries, .. } if entries[0].name == "new2.txt")
+    );
+    workers.latest.store(6, Ordering::Relaxed);
+    workers.search.send(SearchRequest {
+        generation: 6,
+        text: "file:new ext:txt".into(),
+        sort,
+    })?;
+    assert!(
+        matches!(wait(&workers, |e| matches!(e, Event::Results { generation: 6, .. }))?, Event::Results { entries, .. } if entries.len() == 3 && entries[0].name == "new2.txt")
     );
     Ok(())
 }

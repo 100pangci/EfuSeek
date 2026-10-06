@@ -1,4 +1,4 @@
-use efuseek::core::{entry::Entry, worker::PageRequest};
+use efuseek::core::{entry::Entry, sort::Sort, worker::PageRequest};
 use gtk::{gio, glib, prelude::*, subclass::prelude::*};
 use std::{
     cell::{Cell, RefCell},
@@ -12,6 +12,7 @@ mod imp {
     pub struct VirtualList {
         pub count: Cell<u32>,
         pub generation: Cell<u64>,
+        pub sort: Cell<Sort>,
         pub page_size: Cell<u32>,
         pub max_pages: Cell<usize>,
         pub sender: RefCell<Option<Sender<PageRequest>>>,
@@ -58,6 +59,7 @@ mod imp {
                     generation: self.generation.get(),
                     offset,
                     limit: page_size,
+                    sort: self.sort.get(),
                 });
             }
             let mut placeholders = self.placeholders.borrow_mut();
@@ -105,12 +107,13 @@ impl VirtualList {
         self.imp().page_size.set(page_size.clamp(1, 1024));
         self.imp().max_pages.set(max_pages.clamp(1, 64));
     }
-    pub fn browse(&self, total: u64, generation: u64, sender: Sender<PageRequest>) {
+    pub fn browse(&self, total: u64, generation: u64, sender: Sender<PageRequest>, sort: Sort) {
         let imp = self.imp();
         let old = imp.count.get();
         let count = total.min(u64::from(u32::MAX)) as u32;
         imp.count.set(count);
         imp.generation.set(generation);
+        imp.sort.set(sort);
         *imp.sender.borrow_mut() = Some(sender);
         imp.results.borrow_mut().take();
         imp.pages.borrow_mut().clear();
@@ -167,7 +170,7 @@ mod tests {
         let model = VirtualList::new();
         let page_size = model.imp().page_size.get();
         let (send, receive) = std::sync::mpsc::channel();
-        model.browse(828_810, 3, send);
+        model.browse(828_810, 3, send, Sort::default());
         assert_eq!(model.n_items(), 828_810);
         assert!(model.item(828_809).is_some());
         let request = receive.try_recv().expect("page request");
@@ -182,6 +185,16 @@ mod tests {
             .and_downcast::<glib::BoxedAnyObject>()
             .expect("entry");
         assert_eq!(item.borrow::<Entry>().path, "/fresh");
+        let (send, receive) = std::sync::mpsc::channel();
+        let sort = Sort {
+            field: efuseek::core::sort::SortField::Modified,
+            direction: efuseek::core::sort::SortDirection::Descending,
+        };
+        model.browse(828_810, 4, send, sort);
+        assert!(model.item(0).is_some());
+        assert_eq!(receive.try_recv().unwrap().sort, sort);
+        model.page(3, 0, vec![Entry::new("/old-sort".into(), None, None, None)]);
+        assert!(model.imp().pages.borrow().is_empty());
         model.results(vec![Entry::new("/result".into(), None, None, None)]);
         assert_eq!(model.n_items(), 1);
     }

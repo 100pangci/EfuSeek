@@ -13,6 +13,20 @@ pub struct Entry {
 }
 
 impl Entry {
+    pub fn modified_key(&self) -> Option<i64> {
+        modified_key(self.modified.as_deref()?)
+    }
+
+    pub fn display_modified(&self) -> String {
+        self.modified_key()
+            .and_then(filetime_date)
+            .map(|date| {
+                date.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
     pub fn new(
         path: String,
         size: Option<u64>,
@@ -71,9 +85,58 @@ impl Entry {
     }
 }
 
+const FILETIME_EPOCH: i64 = 116_444_736_000_000_000;
+
+fn filetime_date(ticks: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::Datelike;
+    let unix = ticks.checked_sub(FILETIME_EPOCH)?;
+    let date = chrono::DateTime::from_timestamp(
+        unix.div_euclid(10_000_000),
+        (unix.rem_euclid(10_000_000) * 100) as u32,
+    )?;
+    (ticks > 0 && (1601..=9999).contains(&date.year())).then_some(date)
+}
+
+/// Everything EFU dates are Windows FILETIME: 100 ns ticks since 1601-01-01 UTC.
+pub fn modified_key(value: &str) -> Option<i64> {
+    let ticks = value.trim().parse().ok()?;
+    filetime_date(ticks).map(|_| ticks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filetime_dates_and_invalid_values() {
+        let entry = Entry::new("/a".into(), None, Some("116444736000000000".into()), None);
+        assert_eq!(
+            filetime_date(entry.modified_key().unwrap())
+                .unwrap()
+                .to_rfc3339(),
+            "1970-01-01T00:00:00+00:00"
+        );
+        assert!(!entry.display_modified().is_empty());
+        assert_eq!(
+            filetime_date(116444735999999999)
+                .unwrap()
+                .timestamp_subsec_nanos(),
+            999999900
+        );
+        for value in [
+            "",
+            "bad",
+            "0",
+            "-1",
+            "18446744073709551615",
+            "9223372036854775807",
+        ] {
+            assert!(modified_key(value).is_none(), "{value}");
+        }
+        assert_eq!(
+            Entry::new("/a".into(), None, None, None).display_modified(),
+            ""
+        );
+    }
     #[test]
     fn linux_backslashes_and_size() {
         let file = Entry::new("/nas/a\\b.mkv".into(), Some(1024), None, None);

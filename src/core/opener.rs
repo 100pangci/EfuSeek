@@ -11,7 +11,7 @@ pub fn open(
     maps: &[PathMap],
     done: impl FnOnce(Result<(), String>) + 'static,
 ) {
-    let path = if parent { &entry.parent } else { &entry.path };
+    let path = opening_path(entry, parent);
     let target = match map_path(path, maps) {
         Ok(target) => target,
         Err(error) => {
@@ -42,4 +42,29 @@ pub fn open(
             );
         },
     );
+}
+
+fn opening_path(entry: &Entry, parent: bool) -> &str {
+    // A root directory has no EFU parent; opening itself is the useful fallback.
+    if parent && !(entry.is_dir && entry.parent.is_empty()) {
+        &entry.parent
+    } else {
+        &entry.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn containing_directory_and_roots() {
+        let file = Entry::new("/nas/anime/a.mkv".into(), None, None, None);
+        assert_eq!(opening_path(&file, true), "/nas/anime/");
+        let folder = Entry::new("/nas/anime/".into(), None, None, None);
+        assert_eq!(opening_path(&folder, true), "/nas/");
+        for path in ["/", "Z:\\"] {
+            let root = Entry::new(path.into(), None, None, None);
+            assert_eq!(opening_path(&root, true), path);
+        }
+    }
 }

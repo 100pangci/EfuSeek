@@ -1,6 +1,11 @@
-use crate::core::{efu, entry::Entry, query::Query};
+use crate::core::{
+    efu,
+    entry::{Entry, modified_key},
+    query::{self, Query, Term},
+    sort::{Sort, SortDirection, SortField},
+};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, functions::FunctionFlags, params, types::Value};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -9,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceStamp {
     pub path: PathBuf,
@@ -44,26 +49,54 @@ pub struct IndexInfo {
 pub struct Index {
     connection: Connection,
     pub info: IndexInfo,
+    legacy: bool,
 }
 impl Index {
+    pub fn needs_upgrade(&self) -> bool {
+        self.legacy
+    }
+
+    fn order_by(&self, sort: Sort, searching: bool, rank: usize) -> String {
+        let direction = match sort.direction {
+            SortDirection::Ascending => "ASC",
+            SortDirection::Descending => "DESC",
+        };
+        let field = match sort.field {
+            SortField::Default if !searching => return "e.id".into(),
+            SortField::Default => {
+                return format!(
+                    "CASE WHEN e.name_key=?{rank} THEN 0 WHEN substr(e.name_key,1,length(?{rank}))=?{rank} THEN 1 WHEN instr(e.name_key,?{rank})>0 THEN 2 ELSE 3 END,e.name_key,e.id"
+                );
+            }
+            SortField::Name => return format!("e.name_key {direction},e.id ASC"),
+            SortField::Size if self.legacy => "efu_size(e.size,e.is_dir)",
+            SortField::Modified if self.legacy => "efu_modified(e.modified)",
+            SortField::Size => "e.size_key",
+            SortField::Modified => "e.modified_key",
+        };
+        // Unknown metadata (including directory sizes) stays last in either direction.
+        format!("({field} IS NULL) ASC,{field} {direction},e.id ASC")
+    }
+
+    pub fn browse_sorted(&self, offset: u32, limit: u32, sort: Sort) -> Result<Vec<Entry>> {
+        if sort.field == SortField::Default {
+            return self.browse(offset, limit);
+        }
+        let sql = format!(
+            "SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM entries e ORDER BY {} LIMIT ?1 OFFSET ?2",
+            self.order_by(sort, false, 0)
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params![limit.min(1024), offset], read_entry)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
     /// EFU insertion order, using row IDs rather than OFFSET for deep-page access.
     pub fn browse(&self, offset: u32, limit: u32) -> Result<Vec<Entry>> {
         let mut statement = self.connection.prepare(
             "SELECT name,path,parent,extension,size,modified,attributes,is_dir FROM entries WHERE id>?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![offset, limit.min(1024)], |r| {
-            let size: Option<String> = r.get(4)?;
-            Ok(Entry {
-                name: r.get(0)?,
-                path: r.get(1)?,
-                parent: r.get(2)?,
-                extension: r.get(3)?,
-                size: size.and_then(|s| s.parse().ok()),
-                modified: r.get(5)?,
-                attributes: r.get(6)?,
-                is_dir: r.get(7)?,
-            })
-        })?;
+        let rows = statement.query_map(params![offset, limit.min(1024)], read_entry)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -87,7 +120,7 @@ impl Index {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != SCHEMA {
+        if version != SCHEMA && version != 1 {
             bail!("索引版本不兼容，需要重建");
         }
         let text: String =
@@ -97,51 +130,112 @@ impl Index {
         let info = toml::from_str(&text)?;
         // Also verify the search tables are present; corrupt pages are reported by search.
         connection.prepare("SELECT e.id FROM entries e JOIN search s ON s.rowid=e.id LIMIT 0")?;
-        Ok(Self { connection, info })
+        if version == 1 {
+            let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+            connection.create_scalar_function("efu_modified", 1, flags, |ctx| {
+                Ok(ctx
+                    .get::<Option<String>>(0)?
+                    .as_deref()
+                    .and_then(modified_key))
+            })?;
+            connection.create_scalar_function("efu_size", 2, flags, |ctx| {
+                let size = ctx
+                    .get::<Option<String>>(0)?
+                    .and_then(|s| s.parse::<u64>().ok());
+                Ok(if ctx.get::<bool>(1)? {
+                    None
+                } else {
+                    size.map(|n| format!("{n:020}"))
+                })
+            })?;
+        }
+        Ok(Self {
+            connection,
+            info,
+            legacy: version == 1,
+        })
     }
     pub fn search(&self, query: &Query, limit: usize) -> Result<Vec<Entry>> {
-        let text = query.text.to_lowercase();
-        let normalized = Query::parse(&text);
-        let phrase = normalized.fts_phrase();
-        let join = if phrase.is_some() {
-            "JOIN search ON search.rowid=e.id"
-        } else {
+        self.search_sorted(query, limit, Sort::default())
+    }
+
+    pub fn search_sorted(&self, query: &Query, limit: usize, sort: Sort) -> Result<Vec<Entry>> {
+        let mut values: Vec<Value> = Vec::new();
+        let mut filters = vec!["1".to_owned()];
+        let mut phrases = Vec::new();
+        for term in &query.terms {
+            let (text, column) = match term {
+                Term::Extension(text) => {
+                    values.push(text.clone().into());
+                    filters.push(format!("e.is_dir=0 AND e.extension=?{}", values.len()));
+                    continue;
+                }
+                Term::Text(text) => (text, None),
+                Term::File(text) => {
+                    filters.push("e.is_dir=0".into());
+                    (text, Some("name_key"))
+                }
+                Term::Folder(text) => {
+                    filters.push("e.is_dir=1".into());
+                    (text, Some("name_key"))
+                }
+                Term::Path(text) => (text, Some("path_key")),
+            };
+            if let Some(phrase) = query::fts_phrase(text) {
+                phrases.push(match column {
+                    Some(column) => format!("{column} : {phrase}"),
+                    None => phrase,
+                });
+            }
+            values.push(query::like_pattern(text).into());
+            let n = values.len();
+            filters.push(match column {
+                Some(column) => format!(r"e.{column} LIKE ?{n} ESCAPE '\'"),
+                None => {
+                    format!(r"(e.name_key LIKE ?{n} ESCAPE '\' OR e.path_key LIKE ?{n} ESCAPE '\')")
+                }
+            });
+        }
+        let join = if phrases.is_empty() {
             ""
-        };
-        let filter = if phrase.is_some() {
-            r"search MATCH ?1 AND (e.name_key LIKE ?2 ESCAPE '\' OR e.path_key LIKE ?2 ESCAPE '\')"
         } else {
-            r"(e.name_key LIKE ?2 ESCAPE '\' OR e.path_key LIKE ?2 ESCAPE '\') AND ?1 IS NULL"
+            values.push(phrases.join(" AND ").into());
+            filters.push(format!("search MATCH ?{}", values.len()));
+            "JOIN search ON search.rowid=e.id"
         };
-        let sql = format!("SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM entries e {join}
-            WHERE {filter} ORDER BY CASE WHEN e.name_key=?3 THEN 0 WHEN substr(e.name_key,1,length(?3))=?3 THEN 1
-            WHEN instr(e.name_key,?3)>0 THEN 2 ELSE 3 END, e.name_key, e.id LIMIT ?4");
-        // Empty input uses an indexed alphabetical browse instead of scanning/ranking every row.
-        let (sql, phrase, pattern) = if text.is_empty() {
-            ("SELECT name,path,parent,extension,size,modified,attributes,is_dir FROM entries WHERE ?1 IS NULL AND ?2 IS NOT NULL AND ?3='' ORDER BY name_key,id LIMIT ?4".to_owned(), None, String::new())
+        let order = if query.terms.is_empty() && sort.field == SortField::Default {
+            "e.name_key,e.id".into()
         } else {
-            (sql, phrase, normalized.like_pattern())
+            if sort.field == SortField::Default {
+                values.push(query.rank_text().to_owned().into());
+            }
+            self.order_by(sort, true, values.len())
         };
+        values.push((limit.min(5000) as i64).into());
+        let sql = format!(
+            "SELECT e.name,e.path,e.parent,e.extension,e.size,e.modified,e.attributes,e.is_dir FROM entries e {join} WHERE {} ORDER BY {order} LIMIT ?{}",
+            filters.join(" AND "),
+            values.len()
+        );
         let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params![phrase, pattern, text, limit.min(5000) as i64],
-            |r| {
-                let size: Option<String> = r.get(4)?;
-                Ok(Entry {
-                    name: r.get(0)?,
-                    path: r.get(1)?,
-                    parent: r.get(2)?,
-                    extension: r.get(3)?,
-                    size: size.and_then(|s| s.parse().ok()),
-                    modified: r.get(5)?,
-                    attributes: r.get(6)?,
-                    is_dir: r.get(7)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), read_entry)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+}
+
+fn read_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
+    let size: Option<String> = r.get(4)?;
+    Ok(Entry {
+        name: r.get(0)?,
+        path: r.get(1)?,
+        parent: r.get(2)?,
+        extension: r.get(3)?,
+        size: size.and_then(|s| s.parse().ok()),
+        modified: r.get(5)?,
+        attributes: r.get(6)?,
+        is_dir: r.get(7)?,
+    })
 }
 
 struct TemporaryDatabase(PathBuf);
@@ -152,7 +246,18 @@ impl Drop for TemporaryDatabase {
 }
 
 pub fn rebuild(source: &Path, destination: &Path) -> Result<IndexInfo> {
+    rebuild_stamped(source, destination, None)
+}
+
+pub fn rebuild_stamped(
+    source: &Path,
+    destination: &Path,
+    expected: Option<&SourceStamp>,
+) -> Result<IndexInfo> {
     let before = SourceStamp::read(source)?;
+    if expected.is_some_and(|stamp| *stamp != before) {
+        bail!("EFU 在稳定检查后发生变化；保留旧索引，下轮重试");
+    }
     let parent = destination.parent().context("缓存路径没有父目录")?;
     fs::create_dir_all(parent)?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -160,12 +265,12 @@ pub fn rebuild(source: &Path, destination: &Path) -> Result<IndexInfo> {
         TemporaryDatabase(parent.join(format!("build-{}-{nonce}.sqlite", std::process::id())));
     let mut connection = Connection::open(&temporary.0)?;
     connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;
-        CREATE TABLE entries(id INTEGER PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL,parent TEXT NOT NULL,extension TEXT NOT NULL,size TEXT,modified TEXT,attributes INTEGER,is_dir INTEGER NOT NULL,name_key TEXT NOT NULL,path_key TEXT NOT NULL);
+        CREATE TABLE entries(id INTEGER PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL,parent TEXT NOT NULL,extension TEXT NOT NULL,size TEXT,modified TEXT,attributes INTEGER,is_dir INTEGER NOT NULL,name_key TEXT NOT NULL,path_key TEXT NOT NULL,size_key TEXT,modified_key INTEGER);
         CREATE VIRTUAL TABLE search USING fts5(name_key,path_key,content='entries',content_rowid='id',tokenize='trigram');
         CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
     let transaction = connection.transaction()?;
     let stats = {
-        let mut insert = transaction.prepare_cached("INSERT INTO entries(name,path,parent,extension,size,modified,attributes,is_dir,name_key,path_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?;
+        let mut insert = transaction.prepare_cached("INSERT INTO entries(name,path,parent,extension,size,modified,attributes,is_dir,name_key,path_key,size_key,modified_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")?;
         let file = fs::File::open(source).context("无法打开 EFU")?;
         efu::parse(BufReader::with_capacity(1024 * 1024, file), |entry| {
             insert.execute(params![
@@ -178,7 +283,13 @@ pub fn rebuild(source: &Path, destination: &Path) -> Result<IndexInfo> {
                 entry.attributes,
                 entry.is_dir,
                 entry.name.to_lowercase(),
-                entry.path.to_lowercase()
+                entry.path.to_lowercase(),
+                if entry.is_dir {
+                    None
+                } else {
+                    entry.size.map(|n| format!("{n:020}"))
+                },
+                entry.modified_key()
             ])?;
             Ok(())
         })?
@@ -189,6 +300,15 @@ pub fn rebuild(source: &Path, destination: &Path) -> Result<IndexInfo> {
     transaction.execute("INSERT INTO search(search) VALUES('rebuild')", [])?;
     transaction.execute("INSERT INTO search(search) VALUES('optimize')", [])?;
     transaction.execute("CREATE INDEX entries_name ON entries(name_key,id)", [])?;
+    transaction.execute(
+        "CREATE INDEX entries_name_desc ON entries(name_key DESC,id ASC)",
+        [],
+    )?;
+    for field in ["size_key", "modified_key"] {
+        for direction in ["ASC", "DESC"] {
+            transaction.execute(&format!("CREATE INDEX entries_{field}_{direction} ON entries(({field} IS NULL),{field} {direction},id)"), [])?;
+        }
+    }
     let after = SourceStamp::read(source)?;
     if before != after {
         bail!("EFU 在读取期间发生变化；保留旧索引，下轮重试");
@@ -220,6 +340,109 @@ pub fn rebuild(source: &Path, destination: &Path) -> Result<IndexInfo> {
 mod tests {
     use super::*;
     #[test]
+    fn query_filters_literals_and_ranking() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("test.efu");
+        let db = dir.path().join("index.sqlite");
+        fs::write(
+            &source,
+            "Filename,Attributes\n/Galgame/erasmus.zip,32\n/Galgame/patch_%.ZIP,32\n/Galgame/Anime,16\n/Galgame/Anime.zip,16\n/日本/中文.mkv,32\n/日本/a\\b.txt,32\n/日本/a'b.txt,32\n/日本/foo:bar,32\n/Galgame/foo patch.zip,32\n",
+        )?;
+        rebuild(&source, &db)?;
+        let index = Index::open(&db)?;
+        for (query, count) in [
+            ("erasmus ext:.ZIP", 1),
+            ("file:patch path:galgame", 2),
+            ("folder:Anime", 2),
+            ("ext:zip", 3),
+            ("path:日本", 4),
+            ("file:中文 ext:mkv", 1),
+            ("file: folder:Anime", 0),
+            ("file:patch_%", 1),
+            ("path:a\\b", 1),
+            ("file:a'b", 1),
+            ("foo:bar", 1),
+            ("file:' OR 1=1 --", 0),
+            ("ext:zip ext:mkv", 0),
+        ] {
+            assert_eq!(
+                index.search(&Query::parse(query), 500)?.len(),
+                count,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            index.search(&Query::parse("file:patch"), 500)?[0].name,
+            "patch_%.ZIP"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_pages_search_and_legacy_cache() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("test.efu");
+        let db = dir.path().join("index.sqlite");
+        fs::write(
+            &source,
+            "Filename,Size,Date Modified,Attributes\n/z/dup,18446744073709551615,116444736000000001,32\n/a/dup,9,116444736000000000,32\n/b/dir,0,bad,16\n/c/unknown,,,32\n/d/dup,9,116444736000000000,32\n",
+        )?;
+        rebuild(&source, &db)?;
+        for legacy in [false, true] {
+            if legacy {
+                let connection = Connection::open(&db)?;
+                connection.execute_batch("DROP INDEX entries_size_key_ASC; DROP INDEX entries_size_key_DESC; DROP INDEX entries_modified_key_ASC; DROP INDEX entries_modified_key_DESC; ALTER TABLE entries DROP COLUMN size_key; ALTER TABLE entries DROP COLUMN modified_key; PRAGMA user_version=1;")?;
+            }
+            let index = Index::open(&db)?;
+            assert_eq!(index.needs_upgrade(), legacy);
+            for field in [SortField::Name, SortField::Size, SortField::Modified] {
+                for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                    let sort = Sort { field, direction };
+                    if !legacy {
+                        let sql = format!(
+                            "EXPLAIN QUERY PLAN SELECT e.id FROM entries e ORDER BY {} LIMIT 2 OFFSET 2",
+                            index.order_by(sort, false, 0)
+                        );
+                        let mut statement = index.connection.prepare(&sql)?;
+                        let plan = statement
+                            .query_map([], |row| row.get::<_, String>(3))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        assert!(
+                            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                            "{sort:?}: {plan:?}"
+                        );
+                    }
+                    let rows = index.browse_sorted(0, 512, sort)?;
+                    let mut pages = index.browse_sorted(0, 2, sort)?;
+                    pages.extend(index.browse_sorted(2, 2, sort)?);
+                    pages.extend(index.browse_sorted(4, 2, sort)?);
+                    assert_eq!(rows, pages);
+                    assert_eq!(rows, index.search_sorted(&Query::parse(""), 500, sort)?);
+                    if field != SortField::Name {
+                        assert_eq!(rows[3].name, "dir");
+                        assert_eq!(rows[4].name, "unknown");
+                        assert_eq!(
+                            rows[if direction == SortDirection::Ascending {
+                                2
+                            } else {
+                                0
+                            }]
+                            .path,
+                            "/z/dup"
+                        );
+                    }
+                    let matches = index.search_sorted(&Query::parse("file:dup"), 500, sort)?;
+                    assert_eq!(matches.len(), 3);
+                    assert!(
+                        matches.iter().position(|e| e.path == "/a/dup")
+                            < matches.iter().position(|e| e.path == "/d/dup")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn search_cache_and_atomic_replacement() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let source = dir.path().join("test.efu");
@@ -230,6 +453,7 @@ mod tests {
         )?;
         rebuild(&source, &db)?;
         let old = Index::open(&db)?;
+        let previous = SourceStamp::read(&source)?;
         let rows = old.search(&Query::parse("erasmus"), 500)?;
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].name, "erasmus");
@@ -247,6 +471,8 @@ mod tests {
         assert_eq!(old.browse(5, 512)?.len(), 1);
         assert!(old.browse(6, 512)?.is_empty());
         fs::write(&source, "Filename\n/new\n")?;
+        assert!(rebuild_stamped(&source, &db, Some(&previous)).is_err());
+        assert_eq!(Index::open(&db)?.info.count, 6);
         rebuild(&source, &db)?;
         assert_eq!(old.search(&Query::parse("erasmus"), 500)?.len(), 4);
         assert_eq!(Index::open(&db)?.info.count, 1);
@@ -286,6 +512,18 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         index.set_cancellation(latest.clone(), 1, stop.clone());
         assert!(index.search(&Query::parse("a"), 500).is_err());
+        assert!(
+            index
+                .browse_sorted(
+                    9999,
+                    1,
+                    Sort {
+                        field: SortField::Size,
+                        direction: SortDirection::Descending
+                    }
+                )
+                .is_err()
+        );
         index.set_cancellation(latest, 2, stop);
         assert_eq!(index.search(&Query::parse("file9999"), 500)?.len(), 1);
         Ok(())
