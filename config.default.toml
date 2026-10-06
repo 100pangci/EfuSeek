@@ -1,0 +1,11 @@
+# Portable first-run defaults. No machine-specific paths or mappings.
+efu_path = ""
+path_map = []
+cache_dir = "" # Empty: $XDG_CACHE_HOME/efuseek (or ~/.cache/efuseek)
+result_limit = 500
+poll_seconds = 5
+debounce_ms = 75
+window_width = 1100
+window_height = 720
+browse_page_size = 512
+browse_cache_pages = 8

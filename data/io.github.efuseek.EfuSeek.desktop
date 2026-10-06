@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=EfuSeek
+Comment=Search Everything EFU file lists without scanning disks
+Comment[zh_CN]=读取 EFU 索引并搜索文件，不扫描磁盘或 NAS
+Exec=efuseek
+Icon=system-search
+Terminal=false
+StartupNotify=true
+Categories=Utility;GTK;
+Keywords=Everything;EFU;NAS;Search;

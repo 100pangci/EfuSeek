@@ -1,0 +1,7 @@
+/target/
+*.sqlite*
+*.efu
+config.local.toml
+*.bak-*
+/dist/
+/release-notes.md

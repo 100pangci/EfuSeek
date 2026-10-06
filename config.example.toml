@@ -1,0 +1,19 @@
+# Copy into ~/.config/efuseek/config.toml and adjust for your machine.
+efu_path = "/mnt/nas/index/files.efu"
+cache_dir = "" # Empty uses the XDG cache directory.
+result_limit = 500
+poll_seconds = 5
+debounce_ms = 75
+window_width = 1100
+window_height = 720
+browse_page_size = 512
+browse_cache_pages = 8
+
+# TOML single-quoted strings preserve backslashes literally.
+[[path_map]]
+from = 'Z:\'
+to = '/mnt/nas/'
+
+[[path_map]]
+from = '\\NAS\share\'
+to = '/mnt/nas/share/'
